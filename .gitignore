@@ -75,7 +75,10 @@ web_modules/
 # GCP credentials & secrets
 *service-account*.json
 *sa-key*.json
+mcpx-agent-key.json
+*agent-key*.json
 gcp-key*.json
+gcp-sa*.json
 credentials*.json
 
 # Python / uv artifacts

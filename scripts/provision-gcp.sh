@@ -10,7 +10,7 @@ set -euo pipefail
 
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
 
-GCP_PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID (e.g. from mcpx.env)}"
+GCP_PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID (e.g. from mcpx.agent.env)}"
 GCP_REGION="${GCP_REGION:-us-east1}"
 GCP_ZONE="${GCP_ZONE:-${GCP_REGION}-b}"
 VM_NAME="${VM_NAME:-mcpx-gateway}"
@@ -18,12 +18,27 @@ STATIC_IP_NAME="${STATIC_IP_NAME:-mcpx-gateway-ip}"
 MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 DISK_SIZE="${DISK_SIZE:-30GB}"
 DISK_TYPE="${DISK_TYPE:-pd-standard}"
+MCP_SUBDOMAIN="${MCP_SUBDOMAIN:-${DOMAIN:-mcpx.duckdns.org}}"
+
+ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1 || true)"
+if [ -z "${ACTIVE_ACCOUNT}" ]; then
+  echo "ERROR: No active gcloud account found. Authenticate first with:" >&2
+  echo "  gcloud auth activate-service-account --key-file=<path-to-mcpx-agent-key.json>" >&2
+  exit 1
+fi
+echo "==> Active gcloud account: ${ACTIVE_ACCOUNT}"
 
 echo "==> Setting GCP project: ${GCP_PROJECT_ID}"
 gcloud config set project "${GCP_PROJECT_ID}" --quiet
 
 echo "==> Ensuring Compute Engine API is enabled..."
-gcloud services enable compute.googleapis.com --project="${GCP_PROJECT_ID}" --quiet
+if gcloud services list --enabled --project="${GCP_PROJECT_ID}" \
+  --filter='config.name:compute.googleapis.com' --format='value(config.name)' 2>/dev/null \
+  | grep -x 'compute.googleapis.com' >/dev/null; then
+  echo "    Compute Engine API (compute.googleapis.com) is already enabled."
+else
+  gcloud services enable compute.googleapis.com --project="${GCP_PROJECT_ID}" --quiet
+fi
 
 echo "==> Ensuring static external IP '${STATIC_IP_NAME}' in ${GCP_REGION}..."
 if ! gcloud compute addresses describe "${STATIC_IP_NAME}" \
@@ -97,22 +112,39 @@ if ! gcloud compute instances describe "${VM_NAME}" \
     --tags=http-server,https-server \
     --quiet
 else
-  echo "    VM '${VM_NAME}' already exists."
+  VM_STATUS="$(gcloud compute instances describe "${VM_NAME}" \
+    --zone="${GCP_ZONE}" \
+    --project="${GCP_PROJECT_ID}" \
+    --format='value(status)')"
+  echo "    VM '${VM_NAME}' already exists (status: ${VM_STATUS})."
+  if [ "${VM_STATUS}" = "TERMINATED" ] || [ "${VM_STATUS}" = "STOPPED" ]; then
+    echo "    Starting VM '${VM_NAME}'..."
+    gcloud compute instances start "${VM_NAME}" \
+      --zone="${GCP_ZONE}" \
+      --project="${GCP_PROJECT_ID}" \
+      --quiet
+  fi
 fi
 
 echo "==> Waiting for SSH to become ready on '${VM_NAME}'..."
+LAST_SSH_ERR=""
 for attempt in $(seq 1 30); do
-  if gcloud compute ssh "${VM_NAME}" \
+  if SSH_OUT="$(gcloud compute ssh "${VM_NAME}" \
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT_ID}" \
     --quiet \
     --ssh-flag="-o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
-    --command="echo ssh-ready" >/dev/null 2>&1; then
+    --command="echo ssh-ready" 2>&1)"; then
     echo "    SSH is ready!"
     break
   fi
+  LAST_SSH_ERR="${SSH_OUT}"
   if [ "${attempt}" -eq 30 ]; then
     echo "ERROR: Timed out waiting for SSH on ${VM_NAME}." >&2
+    if [ -n "${LAST_SSH_ERR}" ]; then
+      echo "Last SSH error:" >&2
+      echo "${LAST_SSH_ERR}" >&2
+    fi
     exit 1
   fi
   sleep 5
@@ -126,5 +158,5 @@ echo "  Zone:      ${GCP_ZONE}"
 echo "  VM Name:   ${VM_NAME}"
 echo "  Static IP: ${STATIC_IP}"
 echo "============================================================"
-echo "Next step: point your DNS A record (e.g. ${MCP_SUBDOMAIN:-mcpx.duckdns.org}) to ${STATIC_IP}"
-echo "and verify with: dig +short ${MCP_SUBDOMAIN:-mcpx.duckdns.org}"
+echo "Next step: point your DNS A record (e.g. ${MCP_SUBDOMAIN}) to ${STATIC_IP}"
+echo "and verify with: dig +short A ${MCP_SUBDOMAIN} @1.1.1.1"

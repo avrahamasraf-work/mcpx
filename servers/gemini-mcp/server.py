@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "mcp>=1.9.0",
+#   "mcp>=2.0.0",
 #   "google-genai>=1.0.0",
 # ]
 # ///
@@ -14,19 +14,26 @@ from typing import Optional
 
 from google import genai
 from google.genai import types
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-DEFAULT_MODEL = os.environ.get("GEMINI_DEFAULT_MODEL") or "gemini-2.5-flash"
+DEFAULT_MODEL = (os.environ.get("GEMINI_DEFAULT_MODEL") or "").strip() or "gemini-3.8-flash"
 
-mcp = FastMCP("gemini-mcp")
+mcp = MCPServer("gemini-mcp")
 
 
 def _get_client() -> genai.Client:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip() or (os.environ.get("GEMINI_TOKEN") or "").strip()
     if not api_key:
         raise RuntimeError(
-            "GEMINI_API_KEY is not set. Add GEMINI_API_KEY to your gateway .env before calling Gemini tools."
+            "GEMINI_API_KEY (or GEMINI_TOKEN) is not set. Add it to your gateway .env before calling Gemini tools."
         )
+    use_vertexai = os.environ.get("GEMINI_USE_VERTEXAI", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_vertexai:
+        return genai.Client(vertexai=True, api_key=api_key)
     return genai.Client(api_key=api_key)
 
 
@@ -41,7 +48,7 @@ def gemini_generate(
 
     Args:
         prompt: The user prompt to send to Gemini.
-        model: Optional Gemini model name (defaults to GEMINI_DEFAULT_MODEL or gemini-2.5-flash).
+        model: Optional Gemini model name (defaults to GEMINI_DEFAULT_MODEL or gemini-3.8-flash).
         system_instruction: Optional system instruction to steer the response.
         temperature: Optional sampling temperature (0.0 to 2.0).
     """

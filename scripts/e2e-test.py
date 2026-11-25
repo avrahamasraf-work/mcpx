@@ -15,14 +15,15 @@ Zero unit tests, zero mocks — strictly live E2E & integration verification.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import os
+import ssl
 import statistics
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -73,6 +74,36 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[f] * (c - k) + ordered[c] * (k - f)
 
 
+_CONN_POOL: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
+
+
+def _get_connection(scheme: str, host: str, port: int, timeout: float) -> http.client.HTTPConnection:
+    key = (scheme, host, port)
+    conn = _CONN_POOL.get(key)
+    if conn is not None:
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        return conn
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    elif scheme == "http":
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    else:
+        raise ValueError(f"Unsupported URL scheme: {scheme}")
+    _CONN_POOL[key] = conn
+    return conn
+
+
+def _drop_connection(scheme: str, host: str, port: int) -> None:
+    conn = _CONN_POOL.pop((scheme, host, port), None)
+    if conn is not None:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
 def http_request(
     url: str,
     method: str = "GET",
@@ -80,25 +111,49 @@ def http_request(
     payload: Optional[dict[str, Any]] = None,
     timeout: float = 30.0,
 ) -> HttpResult:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
     req_headers = dict(headers or {})
     data: Optional[bytes] = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    req_headers.setdefault("Connection", "keep-alive")
 
-    start = time.perf_counter()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+    for attempt in range(2):
+        conn = _get_connection(scheme, host, port, timeout)
+        start = time.perf_counter()
+        try:
+            conn.request(method, path, body=data, headers=req_headers)
+            resp = conn.getresponse()
             body = resp.read().decode("utf-8", errors="replace")
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+            if resp.will_close or "close" in resp_headers.get("connection", "").lower():
+                _drop_connection(scheme, host, port)
             return HttpResult(resp.status, resp_headers, body, elapsed_ms)
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", errors="replace")
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        resp_headers = {k.lower(): v for k, v in err.headers.items()}
-        return HttpResult(err.code, resp_headers, body, elapsed_ms)
+        except (
+            http.client.RemoteDisconnected,
+            http.client.BadStatusLine,
+            http.client.CannotSendRequest,
+            http.client.ResponseNotReady,
+            BrokenPipeError,
+            ConnectionResetError,
+            ssl.SSLEOFError,
+        ):
+            _drop_connection(scheme, host, port)
+            if attempt == 1:
+                raise
+        except Exception:
+            _drop_connection(scheme, host, port)
+            raise
+    raise RuntimeError("Unreachable")
 
 
 def parse_mcp_response(res: HttpResult) -> dict[str, Any]:
@@ -305,6 +360,8 @@ def run_gemini_e2e(base_url: str, token: str, call_api: bool) -> None:
     if call_api:
         result, call_ms = client.call_tool("gemini_generate", {"prompt": "Reply with exactly: OK"})
         assert not result.get("isError"), f"gemini_generate returned error: {result}"
+        text_blob = " ".join(str(c.get("text") or "") for c in result.get("content", [])).strip()
+        assert text_blob, f"gemini_generate returned empty response: {result}"
         print(
             f"    PASS  gemini initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
             f"gemini_generate={call_ms:.1f}ms"
@@ -365,10 +422,15 @@ def run_profiling(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="E2E & profiling suite for live MCPX gateway")
+    default_host = (os.environ.get("MCP_SUBDOMAIN") or "").strip() or (os.environ.get("DOMAIN") or "").strip()
+    if default_host and not default_host.lower().startswith(("http://", "https://")):
+        default_base_url = f"https://{default_host}"
+    else:
+        default_base_url = default_host
     parser.add_argument(
         "--base-url",
-        default=f"https://{os.environ.get('MCP_SUBDOMAIN', '')}" if os.environ.get("MCP_SUBDOMAIN") else "",
-        help="Gateway base URL (default: https://$MCP_SUBDOMAIN)",
+        default=default_base_url,
+        help="Gateway base URL (default: https://$MCP_SUBDOMAIN or https://$DOMAIN)",
     )
     parser.add_argument(
         "--token",
@@ -383,9 +445,12 @@ def main() -> int:
     parser.add_argument("--json-out", default="", help="Optional path to write JSON profiling report")
     args = parser.parse_args()
 
-    base_url = args.base_url.rstrip("/")
+    if args.iterations < 1:
+        parser.error("--iterations must be >= 1")
+
+    base_url = args.base_url.strip().rstrip("/")
     if not base_url or not args.token:
-        parser.error("Provide --base-url (or MCP_SUBDOMAIN) and --token (or MCP_BEARER_TOKEN).")
+        parser.error("Provide --base-url (or MCP_SUBDOMAIN / DOMAIN) and --token (or MCP_BEARER_TOKEN).")
 
     run_security_and_health_checks(base_url, args.token)
     uv_client = run_uv_time_e2e(base_url, args.token)
