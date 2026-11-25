@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import os
 from typing import Optional
 
@@ -19,6 +20,13 @@ from mcp.server.mcpserver import MCPServer
 DEFAULT_MODEL = (os.environ.get("GEMINI_DEFAULT_MODEL") or "").strip() or "gemini-3.8-flash"
 
 mcp = MCPServer("gemini-mcp")
+
+
+@lru_cache(maxsize=1)
+def _build_client(api_key: str, use_vertexai: bool) -> genai.Client:
+    if use_vertexai:
+        return genai.Client(vertexai=True, api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 def _get_client() -> genai.Client:
@@ -32,13 +40,11 @@ def _get_client() -> genai.Client:
         "true",
         "yes",
     )
-    if use_vertexai:
-        return genai.Client(vertexai=True, api_key=api_key)
-    return genai.Client(api_key=api_key)
+    return _build_client(api_key, use_vertexai)
 
 
 @mcp.tool()
-def gemini_generate(
+async def gemini_generate(
     prompt: str,
     model: Optional[str] = None,
     system_instruction: Optional[str] = None,
@@ -62,7 +68,7 @@ def gemini_generate(
         config_kwargs["temperature"] = temperature
 
     config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
-    response = client.models.generate_content(
+    response = await client.aio.models.generate_content(
         model=chosen_model,
         contents=prompt,
         config=config,
@@ -71,15 +77,17 @@ def gemini_generate(
 
 
 @mcp.tool()
-def gemini_list_models(limit: int = 20) -> list[str]:
+async def gemini_list_models(limit: int = 20) -> list[str]:
     """List available Gemini models accessible with the configured API key."""
     client = _get_client()
+    max_models = max(1, min(limit, 100))
     models: list[str] = []
-    for m in client.models.list():
+    pager = await client.aio.models.list()
+    async for m in pager:
         name = getattr(m, "name", None)
         if name:
             models.append(name)
-        if len(models) >= max(1, min(limit, 100)):
+        if len(models) >= max_models:
             break
     return models
 

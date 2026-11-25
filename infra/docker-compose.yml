@@ -1,8 +1,18 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   mcp-proxy:
-    image: ghcr.io/tbxark/mcp-proxy:latest
+    image: ghcr.io/tbxark/mcp-proxy:v1.1.0
     container_name: mcp-proxy
     restart: unless-stopped
+    mem_limit: 768m
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
     env_file:
       - .env
     volumes:
@@ -28,9 +38,13 @@ services:
       - mcp-net
 
   caddy:
-    image: caddy:alpine
+    image: caddy:2.11.9-alpine
     container_name: caddy
     restart: unless-stopped
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
     env_file:
       - .env
     ports:

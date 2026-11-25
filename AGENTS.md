@@ -8,19 +8,19 @@ This repository manages a remote, HTTPS-protected Model Context Protocol (MCP) g
 - **Compute Tier:** GCP Always Free `e2-micro` VM (`us-east1` / `us-east1-b`, Ubuntu 24.04 LTS, 30 GB `pd-standard` boot disk, 2 GB `/swapfile`).
 - **Networking & TLS:**
   - Regional static external IP attached to the VM.
-  - Firewall allows inbound TCP `80`, TCP/UDP `443` (`http-server`, `https-server` tags), and SSH (`22`).
+  - Firewall allows inbound TCP `80`, TCP/UDP `443` (`http-server`, `https-server` tags), and SSH (`22`, `mcpx-ssh` tag scoped to `SSH_SOURCE_RANGES`, defaulting to IAP `35.235.240.0/20`).
   - Domain: `mcpx.duckdns.org` (DuckDNS `A` record pointing to the static IP).
-  - Reverse Proxy: `caddy:alpine` provides automatic Let's Encrypt HTTPS and blocks any request missing `Authorization: Bearer <MCP_BEARER_TOKEN>` with HTTP `401`.
-- **MCP Gateway:** `ghcr.io/tbxark/mcp-proxy:latest` running on internal Docker network port `9000` (never exposed directly to the public internet). The upstream image includes `uv`, `uvx`, Python 3.13, `node`, and `npx` out of the box.
+  - Reverse Proxy: `caddy:2.11.9-alpine` provides automatic Let's Encrypt HTTPS and blocks any request missing `Authorization: Bearer <MCP_BEARER_TOKEN>` with HTTP `401`.
+- **MCP Gateway:** `ghcr.io/tbxark/mcp-proxy:v1.1.0` running on internal Docker network port `9000` (never exposed directly to the public internet). The upstream image includes `uv`, `uvx`, Python 3.13, `node`, and `npx` out of the box.
 - **Transport:** `streamable-http` — each configured server `<name>` is exposed at `https://<MCP_SUBDOMAIN>/<name>/mcp`.
 
 ## Repository Layout
 
 - `.agents/environment.json`, `.agents/setup.sh` — Cloud agent session bootstrap (installs `gcloud`, `dig`, `nslookup`, `jq`, `openssl`, `pyyaml`).
-- `infra/docker-compose.yml` — Runs `mcp-proxy` (internal only) + `caddy` (ports `80`/`443`) with persistent `uv-cache`, `npm-cache`, and Caddy TLS volumes.
+- `infra/docker-compose.yml` — Runs `mcp-proxy` (internal only) + `caddy` (ports `80`/`443`) with pinned image versions, memory limits, log rotation, `no-new-privileges`, and persistent `uv-cache`, `npm-cache`, and Caddy TLS volumes.
 - `infra/Caddyfile` — Automatic HTTPS + strict Bearer token guard + streaming reverse proxy (`flush_interval -1`).
-- `infra/config.json` — Default `tbxark/mcp-proxy` configuration (`context7` remote Streamable HTTP + `uv-time` via `uvx` to verify `uv` works).
-- `infra/config.with-gemini.json` — Extended config enabling the local `uv`-runnable Gemini MCP server once `GEMINI_API_KEY` (or `GEMINI_TOKEN`) is configured.
+- `infra/config.json` — Default `tbxark/mcp-proxy` configuration (`context7` remote Streamable HTTP + pinned `uv-time` via `uvx` to verify `uv` works).
+- `infra/config.gemini-overlay.json` — Minimal server overlay merged into `infra/config.json` when `ENABLE_GEMINI=1` is passed to `scripts/deploy-vm.sh` (enables the local `uv`-runnable Gemini MCP server once `GEMINI_API_KEY` or `GEMINI_TOKEN` is configured).
 - `infra/.env.example` — Non-secret environment variable template.
 - `servers/gemini-mcp/` — Self-contained Python `uv` MCP server (`mcp>=2.0.0` `MCPServer` + `google-genai`) runnable via `uv run --script /servers/gemini-mcp/server.py`.
 - `scripts/provision-gcp.sh` — Idempotently enables Compute Engine API, reserves static IP, sets firewall rules, and creates the VM.
@@ -79,9 +79,9 @@ bash scripts/deploy-vm.sh
 ```
 To deploy with the local `uv` Gemini MCP server enabled (requires `GEMINI_API_KEY` or `GEMINI_TOKEN` in `mcpx.mcps.env`) and invoke a live Gemini call during E2E verification:
 ```bash
-CONFIG_FILE=infra/config.with-gemini.json E2E_EXTRA_ARGS="--call-gemini" bash scripts/deploy-vm.sh
+ENABLE_GEMINI=1 E2E_EXTRA_ARGS="--call-gemini" bash scripts/deploy-vm.sh
 ```
-*(Note: `deploy-vm.sh` automatically passes `--include-gemini` to `scripts/e2e-test.py` when `CONFIG_FILE` defines `.mcpServers.gemini`, and forwards any additional flags in `E2E_EXTRA_ARGS`.)*
+*(Note: `deploy-vm.sh` merges `infra/config.gemini-overlay.json` into `CONFIG_FILE` when `ENABLE_GEMINI=1`, automatically passes `--include-gemini` to `scripts/e2e-test.py` when the effective config defines `.mcpServers.gemini`, and forwards any additional flags in `E2E_EXTRA_ARGS`.)*
 
 Always delete temporary secret files immediately after finishing:
 ```bash
@@ -98,7 +98,7 @@ This repository intentionally uses **only E2E and integration tests** (no unit t
 
 - **Static config & script checks:**
   - `python3 -c "import yaml; yaml.safe_load(open('infra/docker-compose.yml'))"`
-  - `jq empty .agents/environment.json infra/config.json infra/config.with-gemini.json`
+  - `jq empty .agents/environment.json infra/config.json infra/config.gemini-overlay.json`
   - `python3 -m py_compile servers/gemini-mcp/server.py scripts/e2e-test.py`
   - `bash -n .agents/setup.sh scripts/provision-gcp.sh scripts/deploy-vm.sh`
 - **Live E2E integration tests & latency profiling:**

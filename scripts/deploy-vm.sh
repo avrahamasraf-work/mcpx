@@ -10,6 +10,7 @@ set -euo pipefail
 #      and test HTTPS auth (401 without token, 200 with Bearer token)
 
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -22,7 +23,21 @@ MCP_SUBDOMAIN="${MCP_SUBDOMAIN:-${DOMAIN:-}}"
 : "${MCP_SUBDOMAIN:?Set MCP_SUBDOMAIN or DOMAIN (e.g. mcpx.duckdns.org)}"
 MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN}"
 CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/infra/config.json}"
+ENABLE_GEMINI="${ENABLE_GEMINI:-0}"
+GEMINI_OVERLAY_FILE="${REPO_ROOT}/infra/config.gemini-overlay.json"
 SKIP_DNS_CHECK="${SKIP_DNS_CHECK:-0}"
+USE_IAP_SSH="${USE_IAP_SSH:-0}"
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+  echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+  exit 1
+fi
+jq empty "${CONFIG_FILE}"
+
+SSH_IAP_ARGS=()
+if [ "${USE_IAP_SSH}" = "1" ]; then
+  SSH_IAP_ARGS+=(--tunnel-through-iap)
+fi
 
 VM_IP="$(gcloud compute instances describe "${VM_NAME}" \
   --zone="${GCP_ZONE}" \
@@ -51,8 +66,19 @@ ssh_vm() {
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT_ID}" \
     --quiet \
-    --ssh-flag="-T -o StrictHostKeyChecking=no" \
+    "${SSH_IAP_ARGS[@]}" \
+    --ssh-flag="-T -o StrictHostKeyChecking=accept-new" \
     --command="$1"
+}
+
+scp_vm() {
+  gcloud compute scp \
+    --zone="${GCP_ZONE}" \
+    --project="${GCP_PROJECT_ID}" \
+    --quiet \
+    "${SSH_IAP_ARGS[@]}" \
+    --scp-flag="-o StrictHostKeyChecking=accept-new" \
+    "$@"
 }
 
 echo "==> Configuring 2 GB /swapfile and installing Docker on ${VM_NAME}..."
@@ -78,13 +104,19 @@ fi
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER" || true
 
-mkdir -p "$HOME/mcp-server/servers"
+mkdir -p "$HOME/mcp-server"
+rm -rf "$HOME/mcp-server/servers.new"
+mkdir -p "$HOME/mcp-server/servers.new"
 REMOTE_BOOTSTRAP
 
-echo "==> Preparing temporary .env file locally (chmod 600)..."
+echo "==> Preparing temporary .env and effective config locally (chmod 600)..."
 GEMINI_API_KEY="${GEMINI_API_KEY:-${GEMINI_TOKEN:-}}"
 TMP_ENV="$(mktemp /tmp/mcpx-deploy-env.XXXXXX)"
-trap 'rm -f "${TMP_ENV}"' EXIT
+TMP_CONFIG=""
+cleanup_tmp() {
+  rm -f "${TMP_ENV}" "${TMP_CONFIG}"
+}
+trap cleanup_tmp EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 600 "${TMP_ENV}"
@@ -93,30 +125,38 @@ chmod 600 "${TMP_ENV}"
   printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
   if [ -n "${GEMINI_API_KEY:-}" ]; then
     printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY}"
-    printf 'GEMINI_DEFAULT_MODEL=%s\n' "${GEMINI_DEFAULT_MODEL:-gemini-3.8-flash}"
+  fi
+  if [ -n "${GEMINI_DEFAULT_MODEL:-}" ]; then
+    printf 'GEMINI_DEFAULT_MODEL=%s\n' "${GEMINI_DEFAULT_MODEL}"
+  fi
+  if [ -n "${GEMINI_USE_VERTEXAI:-}" ]; then
+    printf 'GEMINI_USE_VERTEXAI=%s\n' "${GEMINI_USE_VERTEXAI}"
   fi
 } > "${TMP_ENV}"
 
+EFFECTIVE_CONFIG_FILE="${CONFIG_FILE}"
+if [ "${ENABLE_GEMINI}" = "1" ]; then
+  if [ ! -f "${GEMINI_OVERLAY_FILE}" ]; then
+    echo "ERROR: Gemini overlay config not found: ${GEMINI_OVERLAY_FILE}" >&2
+    exit 1
+  fi
+  TMP_CONFIG="$(mktemp /tmp/mcpx-deploy-config.XXXXXX.json)"
+  chmod 600 "${TMP_CONFIG}"
+  jq -s '.[0] * .[1]' "${CONFIG_FILE}" "${GEMINI_OVERLAY_FILE}" > "${TMP_CONFIG}"
+  EFFECTIVE_CONFIG_FILE="${TMP_CONFIG}"
+fi
+
 echo "==> Uploading gateway configs and local MCP servers to ~/mcp-server/..."
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
+scp_vm \
   "${REPO_ROOT}/infra/docker-compose.yml" \
   "${REPO_ROOT}/infra/Caddyfile" \
   "${VM_NAME}:~/mcp-server/"
 
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
-  "${CONFIG_FILE}" \
+scp_vm \
+  "${EFFECTIVE_CONFIG_FILE}" \
   "${VM_NAME}:~/mcp-server/config.json"
 
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
+scp_vm \
   --scp-flag="-p" \
   "${TMP_ENV}" \
   "${VM_NAME}:~/mcp-server/.env"
@@ -129,22 +169,22 @@ if [ -d "${REPO_ROOT}/servers" ]; then
     fi
   done
   if [ "${#SERVER_ENTRIES[@]}" -gt 0 ]; then
-    gcloud compute scp \
-      --zone="${GCP_ZONE}" \
-      --project="${GCP_PROJECT_ID}" \
-      --quiet \
+    scp_vm \
       --recurse \
       "${SERVER_ENTRIES[@]}" \
-      "${VM_NAME}:~/mcp-server/servers/"
+      "${VM_NAME}:~/mcp-server/servers.new/"
   fi
 fi
 
-echo "==> Locking permissions, validating config, and starting Docker Compose stack..."
+echo "==> Locking permissions, syncing servers/, validating config, and starting Docker Compose stack..."
 ssh_vm 'bash -s' <<'REMOTE_START'
 set -euo pipefail
 cd "$HOME/mcp-server"
 chmod 600 .env
 chmod 644 docker-compose.yml Caddyfile config.json
+
+rm -rf "$HOME/mcp-server/servers"
+mv "$HOME/mcp-server/servers.new" "$HOME/mcp-server/servers"
 
 sudo docker compose pull </dev/null
 sudo docker compose run -T --rm --no-deps mcp-proxy --config /config/config.json -check-config </dev/null
@@ -196,7 +236,7 @@ echo ""
 
 echo "==> Running full E2E integration tests & latency profiling..."
 E2E_CMD=(python3 "${SCRIPT_DIR}/e2e-test.py" --iterations "${E2E_ITERATIONS:-5}")
-if jq -e '.mcpServers.gemini' "${CONFIG_FILE}" >/dev/null 2>&1; then
+if jq -e '.mcpServers.gemini' "${EFFECTIVE_CONFIG_FILE}" >/dev/null 2>&1; then
   E2E_CMD+=(--include-gemini)
 fi
 if [ -n "${E2E_EXTRA_ARGS:-}" ]; then
