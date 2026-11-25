@@ -68,7 +68,20 @@ web_modules/
 # dotenv environment variable files
 .env
 .env.*
+*.env
 !.env.example
+!*.env.example
+
+# GCP credentials & secrets
+*service-account*.json
+*sa-key*.json
+gcp-key*.json
+credentials*.json
+
+# Python / uv artifacts
+.venv/
+__pycache__/
+*.py[cod]
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
