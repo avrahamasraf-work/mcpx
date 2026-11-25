@@ -1,0 +1,9 @@
+[project]
+name = "gemini-mcp"
+version = "0.1.0"
+description = "Minimal uv-runnable MCP server wrapping the Google Gemini API (google-genai SDK)."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.9.0",
+    "google-genai>=1.0.0",
+]

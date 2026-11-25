@@ -1,0 +1,45 @@
+{
+  "mcpProxy": {
+    "baseURL": "https://${MCP_SUBDOMAIN}",
+    "addr": ":9000",
+    "name": "MCPX Gateway",
+    "version": "1.0.0",
+    "type": "streamable-http",
+    "startupGracePeriod": "45s",
+    "options": {
+      "panicIfInvalid": false,
+      "logEnabled": true,
+      "autoReconnect": true,
+      "authTokens": [
+        "${MCP_BEARER_TOKEN}"
+      ]
+    }
+  },
+  "mcpServers": {
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "transportType": "streamable-http",
+      "timeout": "60s"
+    },
+    "uv-time": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-time"
+      ],
+      "timeout": "60s"
+    },
+    "gemini": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--script",
+        "/servers/gemini-mcp/server.py"
+      ],
+      "env": {
+        "GEMINI_API_KEY": "${GEMINI_API_KEY}",
+        "GEMINI_DEFAULT_MODEL": "${GEMINI_DEFAULT_MODEL}"
+      },
+      "timeout": "90s"
+    }
+  }
+}
