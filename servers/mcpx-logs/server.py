@@ -38,11 +38,21 @@ GATEWAY_LOG_FILES: dict[str, str] = {
 }
 
 SOURCE_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
-BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
-SECRET_KV_PATTERN = re.compile(
-    r"(?i)\b(api_key|gemini_api_key|gemini_token|mcp_bearer_token|mcp_oauth_password|mcp_oauth_client_secret|mcp_oauth_signing_key|client_secret|refresh_token|access_token)\b"
-    r"(\s*[:=]\s*[\"']?)([^\s\"',;}\]]+)"
+SECRET_KEYS = (
+    "api_key|gemini_api_key|gemini_token|mcp_bearer_token|mcp_oauth_password|mcp_oauth_client_secret"
+    "|mcp_oauth_signing_key|client_secret|refresh_token|access_token|password|code_verifier"
+    "|x-api-key|x-goog-api-key"
 )
+# Applied in order; each pattern replaces the secret part of a match with a placeholder.
+REDACTION_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 [REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"), "[REDACTED_JWT]"),
+    (re.compile(r"\bmcpx_(?:rt|sec|code)_[A-Za-z0-9_-]+"), "[REDACTED_TOKEN]"),
+    (
+        re.compile(rf"(?i)\b({SECRET_KEYS})([\"']?\s*[:=]\s*[\"']?)([^\s\"',;&}}\]]+)"),
+        r"\1\2[REDACTED]",
+    ),
+]
 
 
 def _get_log_dir() -> Path:
@@ -110,8 +120,9 @@ def _validate_source(source: str) -> str:
 
 
 def _redact_secrets(text: str) -> str:
-    redacted = BEARER_PATTERN.sub("Bearer [REDACTED]", text)
-    redacted = SECRET_KV_PATTERN.sub(r"\1\2[REDACTED]", redacted)
+    redacted = text
+    for pattern, replacement in REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
     return redacted
 
 
@@ -127,13 +138,14 @@ def _read_tail_lines(
     tail: deque[str] = deque(maxlen=max_lines)
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for raw_line in handle:
-            line = raw_line.rstrip("\r\n")
-            line_lower = line.lower()
-            if required_lower and required_lower not in line_lower:
+            # Redact before filtering so `search` cannot be used as an oracle for secret values.
+            redacted = _redact_secrets(raw_line.rstrip("\r\n"))
+            redacted_lower = redacted.lower()
+            if required_lower and required_lower not in redacted_lower:
                 continue
-            if search_lower and search_lower not in line_lower:
+            if search_lower and search_lower not in redacted_lower:
                 continue
-            tail.append(_redact_secrets(line))
+            tail.append(redacted)
     return list(tail)
 
 
