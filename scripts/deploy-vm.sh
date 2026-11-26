@@ -115,8 +115,8 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER" || true
 
 mkdir -p "$HOME/mcp-server"
-rm -rf "$HOME/mcp-server/servers.new"
-mkdir -p "$HOME/mcp-server/servers.new"
+rm -rf "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new"
+mkdir -p "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new"
 REMOTE_BOOTSTRAP
 
 echo "==> Preparing temporary .env and effective config locally (chmod 600)..."
@@ -202,15 +202,31 @@ if [ -d "${REPO_ROOT}/servers" ]; then
   fi
 fi
 
-echo "==> Locking permissions, syncing servers/, validating config, and starting Docker Compose stack..."
+if [ -d "${REPO_ROOT}/infra/oauth" ]; then
+  OAUTH_ENTRIES=()
+  for entry in "${REPO_ROOT}/infra/oauth"/*; do
+    if [ -e "${entry}" ]; then
+      OAUTH_ENTRIES+=("${entry}")
+    fi
+  done
+  if [ "${#OAUTH_ENTRIES[@]}" -gt 0 ]; then
+    scp_vm \
+      --recurse \
+      "${OAUTH_ENTRIES[@]}" \
+      "${VM_NAME}:~/mcp-server/oauth.new/"
+  fi
+fi
+
+echo "==> Locking permissions, syncing servers/ and oauth/, validating config, and starting Docker Compose stack..."
 ssh_vm 'bash -s' <<'REMOTE_START'
 set -euo pipefail
 cd "$HOME/mcp-server"
 chmod 600 .env
 chmod 644 docker-compose.yml Caddyfile config.json
 
-rm -rf "$HOME/mcp-server/servers"
+rm -rf "$HOME/mcp-server/servers" "$HOME/mcp-server/oauth"
 mv "$HOME/mcp-server/servers.new" "$HOME/mcp-server/servers"
+mv "$HOME/mcp-server/oauth.new" "$HOME/mcp-server/oauth"
 
 sudo docker compose pull </dev/null
 sudo docker compose run -T --rm --no-deps mcp-proxy --config /config/config.json -check-config </dev/null

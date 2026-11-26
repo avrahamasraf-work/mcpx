@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import math
 import os
+import re
+import secrets
 import ssl
 import statistics
 import subprocess
@@ -107,6 +110,7 @@ def http_request(
     method: str = "GET",
     headers: Optional[dict[str, str]] = None,
     payload: Optional[dict[str, Any]] = None,
+    raw_body: Optional[bytes] = None,
     timeout: float = 30.0,
 ) -> HttpResult:
     parsed = urllib.parse.urlsplit(url)
@@ -118,7 +122,7 @@ def http_request(
         path = f"{path}?{parsed.query}"
 
     req_headers = dict(headers or {})
-    data: Optional[bytes] = None
+    data: Optional[bytes] = raw_body
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         req_headers.setdefault("Content-Type", "application/json")
@@ -331,6 +335,182 @@ def run_security_and_health_checks(base_url: str, token: str, probe_server: str)
         f"    PASS  GET /_readyz (authorized)         -> HTTP 200 ({r_ready.elapsed_ms:.1f} ms) "
         f"status={ready_json.get('status')}"
     )
+
+
+def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> None:
+    print("\n==> E2E test: MCP Authorization (OAuth 2.1 discovery, DCR, PKCE, JWT, refresh, revoke)")
+
+    # 1. Internal forward_auth verifier must not be publicly reachable.
+    r_verify = http_request(f"{base_url}/oauth/verify")
+    assert r_verify.status == 404, f"Expected 404 for public /oauth/verify, got {r_verify.status}"
+    print(f"    PASS  GET /oauth/verify (public blocked) -> HTTP 404 ({r_verify.elapsed_ms:.1f} ms)")
+
+    # 2. Unauthenticated MCP call must advertise RFC 9728 resource_metadata.
+    resource_url = f"{base_url}/{probe_server}/mcp"
+    r_unauth = http_request(
+        resource_url,
+        method="POST",
+        payload={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    )
+    assert r_unauth.status == 401, f"Expected 401 for unauthenticated {resource_url}, got {r_unauth.status}"
+    www_auth = r_unauth.headers.get("www-authenticate", "")
+    match = re.search(r'resource_metadata="([^"]+)"', www_auth)
+    assert match, f"Missing resource_metadata in WWW-Authenticate header: {www_auth!r}"
+    metadata_url = match.group(1)
+
+    # 3. Protected Resource Metadata (RFC 9728) -> Authorization Server Metadata (RFC 8414).
+    r_prm = http_request(metadata_url)
+    assert r_prm.status == 200, f"Protected resource metadata failed: HTTP {r_prm.status} {r_prm.body}"
+    prm = json.loads(r_prm.body)
+    auth_servers = prm.get("authorization_servers") or []
+    assert auth_servers, f"No authorization_servers in PRM: {prm}"
+    issuer = auth_servers[0].rstrip("/")
+
+    r_as = http_request(f"{issuer}/.well-known/oauth-authorization-server")
+    assert r_as.status == 200, f"Authorization server metadata failed: HTTP {r_as.status} {r_as.body}"
+    as_meta = json.loads(r_as.body)
+    assert "S256" in (as_meta.get("code_challenge_methods_supported") or []), f"PKCE S256 missing: {as_meta}"
+    reg_url = as_meta["registration_endpoint"]
+    authz_url = as_meta["authorization_endpoint"]
+    token_url = as_meta["token_endpoint"]
+    revoke_url = as_meta["revocation_endpoint"]
+    print(f"    PASS  Discovery (RFC 9728 + RFC 8414)    -> issuer={issuer}")
+
+    # 4. Dynamic Client Registration (RFC 7591).
+    redirect_uri = "http://127.0.0.1:43210/callback"
+    r_reg = http_request(
+        reg_url,
+        method="POST",
+        payload={
+            "client_name": "mcpx-e2e-oauth-test",
+            "redirect_uris": [redirect_uri],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+    assert r_reg.status == 201, f"DCR failed: HTTP {r_reg.status} {r_reg.body}"
+    client_id = json.loads(r_reg.body)["client_id"]
+    print(f"    PASS  POST /oauth/register (DCR)         -> client_id={client_id}")
+
+    # 5. Authorization Code + PKCE (S256) consent flow.
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    state = secrets.token_hex(12)
+
+    authz_query = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": "mcp:tools",
+            "resource": resource_url,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+    )
+    r_form = http_request(f"{authz_url}?{authz_query}")
+    assert r_form.status == 200, f"GET /oauth/authorize failed: HTTP {r_form.status} {r_form.body[:300]}"
+    csrf_match = re.search(r'name="csrf_token"\s+value="([^"]+)"', r_form.body)
+    assert csrf_match, "Missing csrf_token in consent HTML"
+    csrf_token = csrf_match.group(1)
+
+    form_body = urllib.parse.urlencode(
+        {
+            "csrf_token": csrf_token,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": "mcp:tools",
+            "resource": resource_url,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "password": consent_password,
+            "action": "approve",
+        }
+    ).encode("utf-8")
+    r_approve = http_request(
+        authz_url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        raw_body=form_body,
+    )
+    assert r_approve.status == 302, f"Expected 302 from POST /oauth/authorize, got {r_approve.status}"
+    loc = r_approve.headers.get("location", "")
+    loc_qs = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query)
+    assert loc_qs.get("state", [""])[0] == state, f"OAuth state mismatch: {loc}"
+    auth_code = loc_qs.get("code", [""])[0]
+    assert auth_code, f"Missing authorization code in redirect: {loc}"
+
+    # 6. Token exchange with PKCE verifier.
+    token_body = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "code": auth_code,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+            "resource": resource_url,
+        }
+    ).encode("utf-8")
+    r_tok = http_request(
+        token_url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        raw_body=token_body,
+    )
+    assert r_tok.status == 200, f"Token exchange failed: HTTP {r_tok.status} {r_tok.body}"
+    tok_json = json.loads(r_tok.body)
+    access_token = tok_json["access_token"]
+    refresh_token = tok_json["refresh_token"]
+    print(f"    PASS  OAuth 2.1 PKCE code -> JWT         -> token_type={tok_json.get('token_type')}")
+
+    # 7. Real MCP initialize + tools/list authenticated ONLY by the OAuth 2.1 JWT.
+    oauth_client = McpStreamableClient(resource_url, access_token)
+    init_ms = oauth_client.initialize()
+    tools, list_ms = oauth_client.list_tools()
+    assert tools, f"Expected non-empty tools list via OAuth JWT on {probe_server}"
+    print(
+        f"    PASS  MCP via OAuth JWT ({probe_server}) -> "
+        f"init={init_ms:.1f}ms tools/list={list_ms:.1f}ms count={len(tools)}"
+    )
+
+    # 8. Refresh token rotation & replay protection.
+    refresh_body = urllib.parse.urlencode(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+    ).encode("utf-8")
+    r_ref = http_request(
+        token_url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        raw_body=refresh_body,
+    )
+    assert r_ref.status == 200, f"Refresh token exchange failed: HTTP {r_ref.status} {r_ref.body}"
+    new_refresh = json.loads(r_ref.body)["refresh_token"]
+    assert new_refresh != refresh_token, "Refresh token was not rotated"
+
+    r_replay = http_request(
+        token_url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        raw_body=refresh_body,
+    )
+    assert r_replay.status == 400, f"Expected 400 on replayed refresh token, got {r_replay.status}"
+
+    # 9. Revocation (RFC 7009).
+    r_rev = http_request(
+        revoke_url,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        raw_body=urllib.parse.urlencode({"token": new_refresh}).encode("utf-8"),
+    )
+    assert r_rev.status == 200, f"Token revocation failed: HTTP {r_rev.status}"
+    print("    PASS  Refresh rotation + replay block + RFC 7009 revoke")
 
 
 def run_uv_time_e2e(base_url: str, token: str) -> McpStreamableClient:
@@ -562,6 +742,11 @@ def main() -> int:
         help="Gateway Bearer token (default: $MCP_BEARER_TOKEN)",
     )
     parser.add_argument(
+        "--oauth-password",
+        default=os.environ.get("MCP_OAUTH_PASSWORD", ""),
+        help="OAuth consent password (default: $MCP_OAUTH_PASSWORD or --token)",
+    )
+    parser.add_argument(
         "--servers",
         default="",
         help="Comma-separated servers to test (default: auto-detected via scripts/mcp-servers.sh list)",
@@ -595,8 +780,9 @@ def main() -> int:
     if not active_servers:
         parser.error("No servers selected to test after applying --skip-servers.")
 
-    probe_server = "context7" if "context7" in active_servers else active_servers[0]
+    probe_server = "uv-time" if "uv-time" in active_servers else active_servers[0]
     run_security_and_health_checks(base_url, args.token, probe_server=probe_server)
+    run_oauth_e2e(base_url, consent_password=(args.oauth_password or args.token), probe_server=probe_server)
 
     uv_client: Optional[McpStreamableClient] = None
     c7_client: Optional[McpStreamableClient] = None

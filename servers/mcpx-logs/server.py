@@ -34,12 +34,13 @@ MAX_LINES = 1000
 GATEWAY_LOG_FILES: dict[str, str] = {
     "mcp-proxy": "mcp-proxy.log",
     "caddy": "caddy.log",
+    "mcpx-oauth": "mcpx-oauth.log",
 }
 
 SOURCE_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 SECRET_KV_PATTERN = re.compile(
-    r"(?i)\b(api_key|gemini_api_key|gemini_token|mcp_bearer_token)\b"
+    r"(?i)\b(api_key|gemini_api_key|gemini_token|mcp_bearer_token|mcp_oauth_password|mcp_oauth_client_secret|mcp_oauth_signing_key|client_secret|refresh_token|access_token)\b"
     r"(\s*[:=]\s*[\"']?)([^\s\"',;}\]]+)"
 )
 

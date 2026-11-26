@@ -1,26 +1,26 @@
 # MCPX — Remote MCP Gateway on GCP
 
-MCPX is a self-hosted, HTTPS-protected Model Context Protocol (MCP) gateway running on a GCP Always Free `e2-micro` VM. It exposes remote and local `uv`-based MCP servers over Streamable HTTP behind automatic Let's Encrypt TLS and Bearer token authentication.
+MCPX is a self-hosted, HTTPS-protected Model Context Protocol (MCP) gateway running on a GCP Always Free `e2-micro` VM. It exposes remote and local `uv`-based MCP servers over Streamable HTTP behind automatic Let's Encrypt TLS, supporting both **MCP Authorization (OAuth 2.1)** for web/mobile AI apps (Gemini, Claude.ai, ChatGPT) and static Bearer token auth for CLI/IDE clients.
 
 ## Architecture
 
 ```text
-  MCP Client / MCP Inspector (scripts/inspect.sh)
-                     │
-                     │ HTTPS + Authorization: Bearer <MCP_BEARER_TOKEN>
-                     ▼
-        Caddy (ports 80/443, Let's Encrypt TLS, 401 auth guard)
-                     │
-                     │ Internal Docker network (port 9000, never public)
-                     ▼
-          mcp-proxy (tbxark/mcp-proxy, Streamable HTTP)
-        ┌────────────┼────────────┬─────────────────┐
-        ▼            ▼            ▼                 ▼
-    context7      uv-time    gemini-sound       mcpx-logs
-  (remote HTTP)  (uvx stdio)  (uv stdio)        (uv stdio)
-                                  │                 │
-                                  └──────► /var/log/mcpx ◄──┘
-                                       (shared log volume)
+  MCP Client / Gemini / Claude.ai / ChatGPT / MCP Inspector
+                      │
+                      │ HTTPS + OAuth 2.1 JWT or Bearer <MCP_BEARER_TOKEN>
+                      ▼
+       Caddy (ports 80/443, Let's Encrypt TLS, forward_auth)
+          │                                     │
+          │ /.well-known/*, /oauth/*            │ /<server>/mcp (verified)
+          ▼                                     ▼
+   mcpx-oauth (:9100)                 mcp-proxy (:9000, Streamable HTTP)
+   (OAuth 2.1 + PKCE + DCR)          ┌──────────┼──────────┬────────────┐
+                                     ▼          ▼          ▼            ▼
+                                 context7    uv-time  gemini-sound  mcpx-logs
+                               (remote HTTP)(uvx stdio)(uv stdio)   (uv stdio)
+                                                           │            │
+                                                           └─► /var/log/mcpx ◄─┘
+                                                              (shared log volume)
 ```
 
 ### Included MCP Servers
@@ -108,10 +108,15 @@ Inspect the live gateway directly from your terminal or browser:
 
 Every enabled server is exposed over Streamable HTTP at:
 
-- **URL:** `https://<MCP_SUBDOMAIN>/<server>/mcp` (for example, `https://mcpx.duckdns.org/context7/mcp`)
-- **Header:** `Authorization: Bearer <MCP_BEARER_TOKEN>`
+- **URL:** `https://<MCP_SUBDOMAIN>/<server>/mcp` (for example, `https://mcpx.duckdns.org/uv-time/mcp`)
 
-Example client configuration snippet:
+#### Option A — OAuth 2.1 (Gemini Custom Connected Apps, Claude.ai, ChatGPT)
+1. Paste `https://<MCP_SUBDOMAIN>/<server>/mcp` as the MCP Server URL.
+2. Leave Client ID / Client Secret blank to use Dynamic Client Registration (RFC 7591), **or** enter the optional pre-registered `MCP_OAUTH_CLIENT_ID` and `MCP_OAUTH_CLIENT_SECRET` configured in `mcpx.mcps.env`.
+3. When redirected to the MCPX consent screen, enter your `MCP_OAUTH_PASSWORD` (defaults to `MCP_BEARER_TOKEN`) and click **Authorize**.
+
+#### Option B — Static Bearer Token (CLIs, IDEs, MCP Inspector)
+- **Header:** `Authorization: Bearer <MCP_BEARER_TOKEN>`
 
 ```json
 {
