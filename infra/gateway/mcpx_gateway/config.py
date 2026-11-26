@@ -229,6 +229,12 @@ def _parse_groups(raw: Any, servers: dict[str, ServerConfig]) -> dict[str, Group
         if not isinstance(group_def, dict):
             raise ConfigError(f"Group '{group_name}' definition must be a JSON object")
 
+        enabled = group_def.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"Group '{group_name}.enabled' must be a boolean")
+        if not enabled:
+            continue
+
         description = group_def.get("description", "")
         if not isinstance(description, str):
             raise ConfigError(f"Group '{group_name}.description' must be a string")
@@ -283,7 +289,19 @@ def load_config(path: str | Path) -> GatewayConfig:
     if not isinstance(raw_servers, dict) or not raw_servers:
         raise ConfigError("'servers' must be a non-empty JSON object")
 
-    servers = {name: _parse_server(name, spec) for name, spec in raw_servers.items()}
+    servers: dict[str, ServerConfig] = {}
+    for name, spec in raw_servers.items():
+        if isinstance(spec, dict):
+            enabled = spec.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ConfigError(f"Server '{name}.enabled' must be a boolean")
+            if not enabled:
+                continue
+        servers[name] = _parse_server(name, spec)
+
+    if not servers:
+        raise ConfigError("At least one server in 'servers' must be enabled")
+
     groups = _parse_groups(expanded.get("groups"), servers)
 
     return GatewayConfig(gateway=gateway, servers=servers, groups=groups)

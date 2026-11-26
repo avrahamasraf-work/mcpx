@@ -12,14 +12,14 @@ This repository manages a remote, HTTPS-protected Model Context Protocol (MCP) g
   - Domain: `mcpx.duckdns.org` (DuckDNS `A` record pointing to the static IP).
   - Reverse Proxy & Auth: `caddy:2.11.9-alpine` provides automatic Let's Encrypt HTTPS, routes OAuth 2.1 endpoints (`/.well-known/*`, `/oauth/*`) to `mcpx-oauth:9100`, and guards all MCP/health routes via `forward_auth` (`mcpx-oauth` accepts either static `MCP_BEARER_TOKEN` or OAuth 2.1 PKCE JWTs, returning `401` with RFC 9728 `WWW-Authenticate: Bearer resource_metadata=...` otherwise).
 - **MCP Gateway:** `mcpx-gateway` — custom Python MCP gateway built on the official `mcp` Python SDK, Starlette, and Uvicorn (`infra/gateway/`, `python:3.13-slim` image with `uv`/`uvx` and Node.js 22/`npx`) running on internal Docker network port `9000` (never exposed directly to the public internet).
-- **Enabled Servers & Groups (default):**
-  - Servers (`ENABLED_SERVERS` in `scripts/mcp-servers.sh`, defined in `infra/servers/<name>.json`, overridable via `MCP_SERVERS`): `context7`, `uv-time`, `gemini-sound`, `mcpx-logs`.
-  - Groups (`ENABLED_GROUPS` in `scripts/mcp-servers.sh`, defined in `infra/groups/<name>.json`, overridable via `MCP_GROUPS`, or `MCP_GROUPS="none"` to disable all): `ops`.
+- **Enabled Servers & Groups (static config):**
+  - Servers (`infra/servers/<name>.json`, controlled by `"enabled": true|false`): `context7`, `uv-time`, `gemini-sound`, `mcpx-logs`.
+  - Groups (`infra/groups/<name>.json`, controlled by `"enabled": true|false`): `ops`.
 - **Transport & Endpoints (stateless `streamable-http`):**
   - **Unified:** `https://<MCP_SUBDOMAIN>/mcp` — aggregates all enabled servers with `<server>__<tool>` namespaced tools and prompts.
   - **Per-server:** `https://<MCP_SUBDOMAIN>/<server-name>/mcp` — exposes a single upstream server with original unprefixed tool names.
   - **Group:** `https://<MCP_SUBDOMAIN>/groups/<group-name>/mcp` — exposes a curated `<server>__<tool>` allow-list defined in `infra/groups/<group-name>.json` (e.g., starter group `ops`).
-- **Observability:** Gateway (`caddy`, `mcpx-gateway` → `/var/log/mcpx/mcpx-gateway.log`, `mcpx-oauth`) and local server logs write to shared `/var/log/mcpx` and are queryable over MCP via `mcpx-logs` (`list_log_sources`, `get_logs`); client-side inspection uses `scripts/inspect.sh` (`--list` or Anthropic's MCP Inspector web UI).
+- **Observability:** Each gateway service writes to its own log file under `/var/log/mcpx/` (`caddy.log`, `mcpx-gateway.log`, `mcpx-oauth.log`), and each repo-hosted local server writes to its own separate rotating file under `/var/log/mcpx/servers/<server-name>.log`; all are queryable over MCP via `mcpx-logs` (`list_log_sources`, `get_logs`), and client-side inspection uses `scripts/inspect.sh` (`--list` or Anthropic's MCP Inspector web UI).
 
 ## Repository Layout
 
@@ -41,7 +41,7 @@ This repository manages a remote, HTTPS-protected Model Context Protocol (MCP) g
 - `servers/gemini-sound/` — Self-contained Python `uv` MCP server for Gemini text-to-speech (`gemini_generate_sound` returning WAV `AudioContent`, default model `gemini-2.5-flash-preview-tts`, and `gemini_sound_list_voices`).
 - `servers/mcpx-logs/` — Self-contained Python `uv` MCP server exposing `list_log_sources` and `get_logs(source, lines, search)` over `/var/log/mcpx`.
 - `scripts/provision-gcp.sh` — Idempotently enables Compute Engine API, reserves static IP, sets firewall rules, and creates the VM.
-- `scripts/mcp-servers.sh` — Server & group registry and deployment entrypoint (`list`, `list-groups`, `build-config`, `start`/`deploy`); defines `ENABLED_SERVERS` and `ENABLED_GROUPS` (overridable via `MCP_SERVERS` and `MCP_GROUPS`), merges `infra/config.json` + `infra/servers/<name>.json` + `infra/groups/<name>.json`, validates group server references, and invokes `scripts/deploy-vm.sh` with `MCPS_ENV_FILE`.
+- `scripts/mcp-servers.sh` — Config builder and deployment entrypoint (`list`, `list-groups`, `build-config`, `start`/`deploy`); discovers enabled entries from `infra/servers/*.json` and `infra/groups/*.json` via each file's `"enabled"` flag, merges them with `infra/config.json`, validates group server references, and invokes `scripts/deploy-vm.sh` with `MCPS_ENV_FILE`.
 - `scripts/deploy-vm.sh` — Verifies DNS, configures 2 GB `/swapfile` + Docker, uploads `infra/gateway/`, configs, `servers/`, and `.env`, validates `config.json`, builds and starts Docker Compose, verifies `uv`/`uvx`, checks HTTPS auth (`401` vs `200`), and runs `scripts/e2e-test.py`.
 - `scripts/inspect.sh` — Client-side observability tool: `--list` prints tools/descriptions across all enabled servers, and default mode launches Anthropic's interactive MCP Inspector web UI with temporary `chmod 600` config.
 - `scripts/e2e-test.py` — Live E2E integration test & latency profiler against `https://<MCP_SUBDOMAIN>` (auth checks, OAuth 2.1 flow, `/_healthz` & `/_readyz`, real MCP `initialize`/`tools/list`/`tools/call` across `/mcp`, `/<server>/mcp`, and `/groups/<name>/mcp` on `uv-time`, `context7`, `mcpx-logs` including `mcpx-gateway` log source, and `gemini-sound`, plus p50/p95 latency budgets).
@@ -113,10 +113,9 @@ rm -rf "$WORK_TMP"
 ```
 
 ### 5. Adding New MCP Servers & Tool Groups
-- **Per-server config:** create `infra/servers/<name>.json` with the `mcpx-gateway` server definition under `"servers"` (`url` + `transportType` for remote servers, or `command: "uv"` / `"uvx"` + `args` for stdio servers).
+- **Per-server config:** create `infra/servers/<name>.json` with `"enabled": true` and the `mcpx-gateway` server definition under `"servers"` (`url` + `transportType` for remote servers, or `command: "uv"` / `"uvx"` + `args` for stdio servers). Toggle `"enabled": false` in the same file to disable it.
 - **Repo-hosted `uv` servers:** place scripts in `servers/<name>/server.py` using PEP 723 inline script metadata and run via `uv run --script /servers/<name>/server.py` so `/servers` stays mounted `:ro` and dependencies cache in `uv-cache`.
-- **Enable server:** add `<name>` to `ENABLED_SERVERS` in `scripts/mcp-servers.sh` (or override with `MCP_SERVERS`).
-- **Tool groups:** create `infra/groups/<group-name>.json` with `"groups": { "<group-name>": { "description": "...", "servers": { "<server>": "*" | ["<tool>", ...] } } }`, then add `<group-name>` to `ENABLED_GROUPS` in `scripts/mcp-servers.sh` (or override with `MCP_GROUPS`, using `MCP_GROUPS="none"` to disable all groups).
+- **Tool groups:** create `infra/groups/<group-name>.json` with `"groups": { "<group-name>": { "enabled": true, "description": "...", "servers": { "<server>": "*" | ["<tool>", ...] } } }`. Toggle `"enabled": false` in the same file to disable it.
 - **Secrets:** reference secrets via `${ENV_VAR}` in `infra/servers/<name>.json` (`mcpx-gateway` expands env vars from the container environment) and store real values only in `mcpx.mcps.env` inside Drive folder `mcpx/` and `~/mcp-server/.env` (`chmod 600`) on the VM.
 
 ### 6. Testing & Profiling Policy (E2E / Integration Only — No Unit Tests)

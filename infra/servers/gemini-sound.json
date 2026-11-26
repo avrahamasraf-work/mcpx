@@ -1,6 +1,7 @@
 {
   "servers": {
     "gemini-sound": {
+      "enabled": true,
       "command": "uv",
       "args": [
         "run",

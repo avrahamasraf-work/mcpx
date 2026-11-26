@@ -1,6 +1,7 @@
 {
   "servers": {
     "mcpx-logs": {
+      "enabled": true,
       "command": "uv",
       "args": [
         "run",

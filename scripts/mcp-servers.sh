@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Registry and config builder for MCP servers and tool groups in mcpx-gateway.
-# Declares enabled servers and groups, merges infra/config.json with each
-# infra/servers/<name>.json and infra/groups/<name>.json, and delegates deploy.
+# Config builder and deployment entrypoint for MCP servers and tool groups.
+# Discovers enabled servers in infra/servers/*.json and enabled groups in
+# infra/groups/*.json (via each file's "enabled" flag), merges them with
+# infra/config.json, validates group references, and delegates to deploy-vm.sh.
 
 set -euo pipefail
 
@@ -11,69 +12,72 @@ BASE_CONFIG="${REPO_ROOT}/infra/config.json"
 SERVERS_DIR="${REPO_ROOT}/infra/servers"
 GROUPS_DIR="${REPO_ROOT}/infra/groups"
 
-# Single source of truth for which servers in infra/servers/ are deployed.
-# Override at runtime with space-separated MCP_SERVERS="context7 uv-time".
-ENABLED_SERVERS=(
-  context7
-  uv-time
-  gemini-sound
-  mcpx-logs
-)
-
-if [ -n "${MCP_SERVERS:-}" ]; then
-  read -r -a ENABLED_SERVERS <<< "${MCP_SERVERS}"
-fi
-
-# Single source of truth for which tool groups in infra/groups/ are deployed.
-# Override at runtime with space-separated MCP_GROUPS="ops" or MCP_GROUPS="none".
-ENABLED_GROUPS=(
-  ops
-)
-
-if [ -n "${MCP_GROUPS:-}" ]; then
-  if [ "${MCP_GROUPS}" = "none" ]; then
-    ENABLED_GROUPS=()
-  else
-    read -r -a ENABLED_GROUPS <<< "${MCP_GROUPS}"
-  fi
-fi
-
 usage() {
   cat <<'EOF'
 Usage: scripts/mcp-servers.sh <command> [args]
 
-Manage enabled MCP servers and tool groups and build the merged mcpx-gateway config.
+Build the merged mcpx-gateway config from static JSON files in infra/servers/
+and infra/groups/ (controlled by each entry's "enabled" boolean, default true).
 
 Commands:
   list                        Print enabled server names (one per line)
   list-groups                 Print enabled group names (one per line)
-  build-config [output_path]  Merge infra/config.json + infra/servers/<name>.json
-                              + infra/groups/<name>.json, validate group server
+  build-config [output_path]  Merge infra/config.json + enabled infra/servers/*.json
+                              + enabled infra/groups/*.json, validate group server
                               references, and write JSON to output_path or stdout
   start | deploy              Build config to a temp file and run scripts/deploy-vm.sh
   -h | --help                 Show this help message
-
-Environment:
-  MCP_SERVERS                 Optional space-separated list overriding ENABLED_SERVERS
-  MCP_GROUPS                  Optional space-separated list overriding ENABLED_GROUPS
-                              (use "none" to disable all groups)
 EOF
 }
 
+collect_json_files() {
+  local dir="$1"
+  local file
+  if [ -d "${dir}" ]; then
+    for file in "${dir}"/*.json; do
+      [ -f "${file}" ] || continue
+      jq empty "${file}"
+      printf '%s\n' "${file}"
+    done
+  fi
+}
+
 cmd_list() {
-  local name
-  for name in "${ENABLED_SERVERS[@]}"; do
-    printf '%s\n' "${name}"
-  done
+  local files=()
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${SERVERS_DIR}")
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  jq -rs '
+    reduce .[] as $item ({}; . * ($item.servers // {})) |
+    to_entries[] |
+    select((.value.enabled // true) == true) |
+    .key
+  ' "${files[@]}"
 }
 
 cmd_list_groups() {
-  local name
-  if [ "${#ENABLED_GROUPS[@]}" -gt 0 ]; then
-    for name in "${ENABLED_GROUPS[@]}"; do
-      printf '%s\n' "${name}"
-    done
+  local files=()
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${GROUPS_DIR}")
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
   fi
+
+  jq -rs '
+    reduce .[] as $item ({}; . * ($item.groups // {})) |
+    to_entries[] |
+    select((.value.enabled // true) == true) |
+    .key
+  ' "${files[@]}"
 }
 
 cmd_build_config() {
@@ -85,31 +89,20 @@ cmd_build_config() {
   jq empty "${BASE_CONFIG}"
 
   local files=("${BASE_CONFIG}")
-  local name server_file group_file
-  for name in "${ENABLED_SERVERS[@]}"; do
-    server_file="${SERVERS_DIR}/${name}.json"
-    if [ ! -f "${server_file}" ]; then
-      echo "ERROR: Server config not found: ${server_file}" >&2
-      exit 1
-    fi
-    jq empty "${server_file}"
-    files+=("${server_file}")
-  done
-
-  if [ "${#ENABLED_GROUPS[@]}" -gt 0 ]; then
-    for name in "${ENABLED_GROUPS[@]}"; do
-      group_file="${GROUPS_DIR}/${name}.json"
-      if [ ! -f "${group_file}" ]; then
-        echo "ERROR: Group config not found: ${group_file}" >&2
-        exit 1
-      fi
-      jq empty "${group_file}"
-      files+=("${group_file}")
-    done
-  fi
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${SERVERS_DIR}")
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${GROUPS_DIR}")
 
   local merged
-  merged="$(jq -s 'reduce .[] as $item ({}; . * $item)' "${files[@]}")"
+  merged="$(jq -s '
+    reduce .[] as $item ({}; . * $item) |
+    .servers = ((.servers // {}) | with_entries(select((.value.enabled // true) == true))) |
+    .groups  = ((.groups  // {}) | with_entries(select((.value.enabled // true) == true)))
+  ' "${files[@]}")"
 
   local missing
   missing="$(printf '%s\n' "${merged}" | jq -r '

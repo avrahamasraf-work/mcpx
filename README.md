@@ -48,8 +48,8 @@ MCPX is a self-hosted, HTTPS-protected Model Context Protocol (MCP) gateway runn
 
 ### 1. Manage MCP Servers & Tool Groups
 
-Each MCP server is defined in `infra/servers/<name>.json`, and each tool group is defined in `infra/groups/<name>.json`.
-Active servers and groups are controlled by `ENABLED_SERVERS` and `ENABLED_GROUPS` in `scripts/mcp-servers.sh`:
+Each MCP server is defined in `infra/servers/<name>.json` and each tool group is defined in `infra/groups/<name>.json`.
+Every file is the single source of truth for its entry—toggle `"enabled": true` or `"enabled": false` directly in the JSON file (defaults to `true` if omitted):
 
 - **List enabled servers / groups:**
   ```bash
@@ -60,18 +60,19 @@ Active servers and groups are controlled by `ENABLED_SERVERS` and `ENABLED_GROUP
   ```bash
   bash scripts/mcp-servers.sh build-config
   ```
-- **Enable or disable a server or group:** update `ENABLED_SERVERS` or `ENABLED_GROUPS` in `scripts/mcp-servers.sh` (or override at runtime via `MCP_SERVERS="..."` / `MCP_GROUPS="..."`, using `MCP_GROUPS="none"` to disable all groups), then redeploy.
+- **Enable or disable a server or group:** set `"enabled": true` or `"enabled": false` in `infra/servers/<name>.json` or `infra/groups/<name>.json`, then redeploy.
 - **Add a new server:**
-  1. Create `infra/servers/<name>.json` with its `mcpx-gateway` server definition under `"servers"` (remote `url` + `transportType`, or `uv`/`uvx` stdio `command` + `args`).
+  1. Create `infra/servers/<name>.json` with `"enabled": true` and its `mcpx-gateway` server definition under `"servers"` (remote `url` + `transportType`, or `uv`/`uvx` stdio `command` + `args`).
   2. If it is a repo-hosted Python server, place the script in `servers/<name>/server.py` (PEP 723 inline metadata) and invoke it via `uv run --script /servers/<name>/server.py`.
   3. Reference any required secrets via `${ENV_VAR}` in the JSON and store the real values in `mcpx.mcps.env`.
-  4. Add `<name>` to `ENABLED_SERVERS` in `scripts/mcp-servers.sh` and deploy.
+  4. Redeploy.
 - **Add a new tool group:**
-  1. Create `infra/groups/<group-name>.json` mapping enabled server names to either `"*"` (all tools) or an explicit list of tool names:
+  1. Create `infra/groups/<group-name>.json` with `"enabled": true` mapping enabled server names to either `"*"` (all tools) or an explicit list of tool names:
      ```json
      {
        "groups": {
          "ops": {
+           "enabled": true,
            "description": "Operations tools (current time and gateway/server logs)",
            "servers": {
              "uv-time": ["get_current_time"],
@@ -81,7 +82,7 @@ Active servers and groups are controlled by `ENABLED_SERVERS` and `ENABLED_GROUP
        }
      }
      ```
-  2. Add `<group-name>` to `ENABLED_GROUPS` in `scripts/mcp-servers.sh` and deploy.
+  2. Redeploy.
 
 ### 2. Manage Secrets (`mcpx.mcps.env`)
 
