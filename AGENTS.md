@@ -10,11 +10,11 @@ This repository manages a remote, HTTPS-protected Model Context Protocol (MCP) g
   - Regional static external IP attached to the VM.
   - Firewall allows inbound TCP `80`, TCP/UDP `443` (`http-server`, `https-server` tags), and SSH (`22`, `mcpx-ssh` tag scoped to `SSH_SOURCE_RANGES`, defaulting to IAP `35.235.240.0/20`).
   - Domain: `mcpx.duckdns.org` (DuckDNS `A` record pointing to the static IP).
-  - Reverse Proxy: `caddy:2.11.9-alpine` provides automatic Let's Encrypt HTTPS and blocks any request missing `Authorization: Bearer <MCP_BEARER_TOKEN>` with HTTP `401`.
+  - Reverse Proxy & Auth: `caddy:2.11.9-alpine` provides automatic Let's Encrypt HTTPS, routes OAuth 2.1 endpoints (`/.well-known/*`, `/oauth/*`) to `mcpx-oauth:9100`, and guards all MCP/health routes via `forward_auth` (`mcpx-oauth` accepts either static `MCP_BEARER_TOKEN` or OAuth 2.1 PKCE JWTs, returning `401` with RFC 9728 `WWW-Authenticate: Bearer resource_metadata=...` otherwise).
 - **MCP Gateway:** `ghcr.io/tbxark/mcp-proxy:v0.58.0` running on internal Docker network port `9000` (never exposed directly to the public internet). The upstream image includes `uv`, `uvx`, Python 3.13, `node`, and `npx` out of the box.
 - **Enabled Servers (default):** `context7`, `uv-time`, `gemini-sound`, `mcpx-logs` (managed via `ENABLED_SERVERS` in `scripts/mcp-servers.sh` and per-server JSON definitions in `infra/servers/<name>.json`).
 - **Transport:** `streamable-http` — each configured server `<name>` is exposed at `https://<MCP_SUBDOMAIN>/<name>/mcp`.
-- **Observability:** Gateway and local server logs write to shared `/var/log/mcpx` and are queryable over MCP via `mcpx-logs` (`list_log_sources`, `get_logs`); client-side inspection uses `scripts/inspect.sh` (`--list` or Anthropic's MCP Inspector web UI).
+- **Observability:** Gateway (`caddy`, `mcp-proxy`, `mcpx-oauth`) and local server logs write to shared `/var/log/mcpx` and are queryable over MCP via `mcpx-logs` (`list_log_sources`, `get_logs`); client-side inspection uses `scripts/inspect.sh` (`--list` or Anthropic's MCP Inspector web UI).
 
 ## Repository Layout
 
@@ -25,8 +25,9 @@ This repository manages a remote, HTTPS-protected Model Context Protocol (MCP) g
   - `testing` — Integration, CLI, and E2E testing over trivial unit tests.
   - `grow-autonomy` — Improving agent instructions and system structure from root causes.
   - `audit-agent-context` — Read-only audit of repo instructions, skills, and context quality (manual invocation).
-- `infra/docker-compose.yml` — Runs `mcp-proxy` (internal only) + `caddy` (ports `80`/`443`) with pinned image versions, memory limits, log rotation, `no-new-privileges`, shared `/var/log/mcpx` volume, and persistent `uv-cache`, `npm-cache`, and Caddy TLS volumes.
-- `infra/Caddyfile` — Automatic HTTPS + strict Bearer token guard + streaming reverse proxy (`flush_interval -1`).
+- `infra/docker-compose.yml` — Runs `mcp-proxy` (internal `:9000`) + `mcpx-oauth` (internal `:9100`) + `caddy` (ports `80`/`443`) with pinned image versions, memory limits, log rotation, `no-new-privileges`, shared `/var/log/mcpx` volume, and persistent `oauth-data`, `uv-cache`, `npm-cache`, and Caddy TLS volumes.
+- `infra/Caddyfile` — Automatic HTTPS + `mcpx-oauth` `forward_auth` guard + OAuth 2.1 public route forwarding + streaming reverse proxy (`flush_interval -1`).
+- `infra/oauth/server.py` — Pure-stdlib Python OAuth 2.1 Authorization Server (RFC 9728, RFC 8414, RFC 7591 DCR, static Client ID/Secret, PKCE `S256`, refresh-token rotation, RFC 7009 revocation) and Caddy `forward_auth` verifier.
 - `infra/servers/<name>.json` — Per-server `tbxark/mcp-proxy` definitions (`context7.json`, `uv-time.json`, `gemini-sound.json`, `mcpx-logs.json`).
 - `infra/.env.example` — Non-secret environment variable template.
 - `servers/gemini-sound/` — Self-contained Python `uv` MCP server for Gemini text-to-speech (`gemini_generate_sound` returning WAV `AudioContent`, default model `gemini-2.5-flash-preview-tts`, and `gemini_sound_list_voices`).

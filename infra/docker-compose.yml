@@ -60,6 +60,43 @@ services:
     networks:
       - mcp-net
 
+  mcpx-oauth:
+    image: python:3.13-alpine
+    container_name: mcpx-oauth
+    restart: unless-stopped
+    mem_limit: 96m
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    env_file:
+      - .env
+    environment:
+      MCPX_LOG_DIR: /var/log/mcpx
+      MCP_OAUTH_DB_PATH: /data/oauth.db
+    command:
+      - python3
+      - /app/server.py
+    volumes:
+      - ./oauth:/app:ro
+      - oauth-data:/data
+      - mcpx-logs:/var/log/mcpx
+    expose:
+      - "9100"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/_healthz', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - mcp-net
+
   caddy:
     image: caddy:2.11.9-alpine
     container_name: caddy
@@ -82,12 +119,15 @@ services:
     depends_on:
       mcp-proxy:
         condition: service_healthy
+      mcpx-oauth:
+        condition: service_healthy
     networks:
       - mcp-net
 
 volumes:
   caddy-data:
   caddy-config:
+  oauth-data:
   uv-cache:
   npm-cache:
   mcpx-logs:

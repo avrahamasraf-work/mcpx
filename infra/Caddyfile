@@ -1,7 +1,7 @@
 # Caddy reverse proxy configuration for the MCPX HTTPS gateway.
-# Terminates Let's Encrypt TLS, enforces Bearer token auth, and streams
-# MCP traffic to the internal mcp-proxy service on port 9000.
-# Writes rotating JSON access logs to /var/log/mcpx/caddy.log.
+# Terminates Let's Encrypt TLS, routes OAuth 2.1 discovery/auth endpoints to
+# mcpx-oauth, verifies static Bearer or OAuth 2.1 JWTs via forward_auth, and
+# streams MCP traffic to the internal mcp-proxy service on port 9000.
 {$MCP_SUBDOMAIN} {
 	log {
 		output file /var/log/mcpx/caddy.log {
@@ -11,12 +11,23 @@
 		format json
 	}
 
-	@unauthorized {
-		not header Authorization "Bearer {$MCP_BEARER_TOKEN}"
+	@internal_verify path /oauth/verify
+	handle @internal_verify {
+		respond "Not Found" 404
 	}
-	respond @unauthorized "Unauthorized" 401
 
-	reverse_proxy mcp-proxy:9000 {
-		flush_interval -1
+	@oauth_public path /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/* /.well-known/oauth-authorization-server /.well-known/openid-configuration /oauth/*
+	handle @oauth_public {
+		reverse_proxy mcpx-oauth:9100
+	}
+
+	handle {
+		forward_auth mcpx-oauth:9100 {
+			uri /oauth/verify
+			copy_headers X-Mcpx-Auth>Authorization
+		}
+		reverse_proxy mcp-proxy:9000 {
+			flush_interval -1
+		}
 	}
 }
