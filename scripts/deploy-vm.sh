@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
+# Deploys the MCPX gateway stack (Caddy + tbxark/mcp-proxy) to the GCP VM over SSH.
+# Bootstraps swap/Docker, builds the merged config via scripts/mcp-servers.sh when
+# CONFIG_FILE is unset, syncs secrets from MCPS_ENV_FILE into ~/mcp-server/.env,
+# starts Docker Compose, and runs live HTTPS and E2E verification.
+
 set -euo pipefail
 
-# Provision the VM over SSH and deploy the Caddy + tbxark/mcp-proxy stack:
-#   1. Verify DNS A record resolves to the VM's static external IP
-#   2. Create and enable a 2 GB /swapfile persisted in /etc/fstab
-#   3. Install Docker and Docker Compose plugin
-#   4. Upload infra files (docker-compose.yml, Caddyfile, config.json) + servers/ + secure .env
-#   5. Validate mcp-proxy config, start containers, verify uv works inside mcp-proxy,
-#      and test HTTPS auth (401 without token, 200 with Bearer token)
-
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,9 +18,36 @@ GCP_ZONE="${GCP_ZONE:-${GCP_REGION}-b}"
 VM_NAME="${VM_NAME:-mcpx-gateway}"
 MCP_SUBDOMAIN="${MCP_SUBDOMAIN:-${DOMAIN:-}}"
 : "${MCP_SUBDOMAIN:?Set MCP_SUBDOMAIN or DOMAIN (e.g. mcpx.duckdns.org)}"
-MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN}"
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/infra/config.json}"
+MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:-}"
+CONFIG_FILE="${CONFIG_FILE:-}"
+MCPS_ENV_FILE="${MCPS_ENV_FILE:-}"
 SKIP_DNS_CHECK="${SKIP_DNS_CHECK:-0}"
+USE_IAP_SSH="${USE_IAP_SSH:-0}"
+
+if [ -n "${CONFIG_FILE}" ]; then
+  if [ ! -f "${CONFIG_FILE}" ]; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+  jq empty "${CONFIG_FILE}"
+fi
+
+if [ -n "${MCPS_ENV_FILE}" ]; then
+  if [ ! -f "${MCPS_ENV_FILE}" ]; then
+    echo "ERROR: MCPS_ENV_FILE not found: ${MCPS_ENV_FILE}" >&2
+    exit 1
+  fi
+  if [ -z "${MCP_BEARER_TOKEN}" ]; then
+    MCP_BEARER_TOKEN="$(grep -E '^(export[[:space:]]+)?MCP_BEARER_TOKEN=' "${MCPS_ENV_FILE}" | tail -n 1 | sed -E 's/^(export[[:space:]]+)?MCP_BEARER_TOKEN=//; s/\r$//; s/^["'\'']//; s/["'\'']$//' || true)"
+  fi
+fi
+
+: "${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN (or provide it inside MCPS_ENV_FILE)}"
+
+SSH_IAP_ARGS=()
+if [ "${USE_IAP_SSH}" = "1" ]; then
+  SSH_IAP_ARGS+=(--tunnel-through-iap)
+fi
 
 VM_IP="$(gcloud compute instances describe "${VM_NAME}" \
   --zone="${GCP_ZONE}" \
@@ -51,8 +76,19 @@ ssh_vm() {
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT_ID}" \
     --quiet \
-    --ssh-flag="-T -o StrictHostKeyChecking=no" \
+    "${SSH_IAP_ARGS[@]}" \
+    --ssh-flag="-T -o StrictHostKeyChecking=accept-new" \
     --command="$1"
+}
+
+scp_vm() {
+  gcloud compute scp \
+    --zone="${GCP_ZONE}" \
+    --project="${GCP_PROJECT_ID}" \
+    --quiet \
+    "${SSH_IAP_ARGS[@]}" \
+    --scp-flag="-o StrictHostKeyChecking=accept-new" \
+    "$@"
 }
 
 echo "==> Configuring 2 GB /swapfile and installing Docker on ${VM_NAME}..."
@@ -78,45 +114,75 @@ fi
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER" || true
 
-mkdir -p "$HOME/mcp-server/servers"
+mkdir -p "$HOME/mcp-server"
+rm -rf "$HOME/mcp-server/servers.new"
+mkdir -p "$HOME/mcp-server/servers.new"
 REMOTE_BOOTSTRAP
 
-echo "==> Preparing temporary .env file locally (chmod 600)..."
-GEMINI_API_KEY="${GEMINI_API_KEY:-${GEMINI_TOKEN:-}}"
+echo "==> Preparing temporary .env and effective config locally (chmod 600)..."
 TMP_ENV="$(mktemp /tmp/mcpx-deploy-env.XXXXXX)"
-trap 'rm -f "${TMP_ENV}"' EXIT
+TMP_CONFIG=""
+cleanup_tmp() {
+  rm -f "${TMP_ENV}" "${TMP_CONFIG}"
+}
+trap cleanup_tmp EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 600 "${TMP_ENV}"
+
 {
   printf 'MCP_SUBDOMAIN=%s\n' "${MCP_SUBDOMAIN}"
-  printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
-  if [ -n "${GEMINI_API_KEY:-}" ]; then
-    printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY}"
-    printf 'GEMINI_DEFAULT_MODEL=%s\n' "${GEMINI_DEFAULT_MODEL:-gemini-3.8-flash}"
+  if [ -n "${MCPS_ENV_FILE}" ]; then
+    has_bearer_token=0
+    while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+      line="${raw_line%$'\r'}"
+      case "${line}" in
+        ""|\#*) continue ;;
+      esac
+      if [[ "${line}" =~ ^[[:space:]]*# ]] || [[ "${line}" =~ ^[[:space:]]*$ ]]; then
+        continue
+      fi
+      line="${line#export }"
+      if [[ "${line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        key="${line%%=*}"
+        if [ "${key}" = "MCP_SUBDOMAIN" ]; then
+          continue
+        fi
+        if [ "${key}" = "MCP_BEARER_TOKEN" ]; then
+          has_bearer_token=1
+        fi
+        printf '%s\n' "${line}"
+      fi
+    done < "${MCPS_ENV_FILE}"
+    if [ "${has_bearer_token}" -eq 0 ]; then
+      printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
+    fi
+  else
+    echo "WARNING: MCPS_ENV_FILE is not set; only MCP_SUBDOMAIN and MCP_BEARER_TOKEN will be written to .env." >&2
+    printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
   fi
 } > "${TMP_ENV}"
 
+if [ -n "${CONFIG_FILE}" ]; then
+  EFFECTIVE_CONFIG_FILE="${CONFIG_FILE}"
+else
+  TMP_CONFIG="$(mktemp /tmp/mcpx-deploy-config.XXXXXX.json)"
+  chmod 600 "${TMP_CONFIG}"
+  bash "${SCRIPT_DIR}/mcp-servers.sh" build-config "${TMP_CONFIG}"
+  EFFECTIVE_CONFIG_FILE="${TMP_CONFIG}"
+fi
+
 echo "==> Uploading gateway configs and local MCP servers to ~/mcp-server/..."
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
+scp_vm \
   "${REPO_ROOT}/infra/docker-compose.yml" \
   "${REPO_ROOT}/infra/Caddyfile" \
   "${VM_NAME}:~/mcp-server/"
 
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
-  "${CONFIG_FILE}" \
+scp_vm \
+  "${EFFECTIVE_CONFIG_FILE}" \
   "${VM_NAME}:~/mcp-server/config.json"
 
-gcloud compute scp \
-  --zone="${GCP_ZONE}" \
-  --project="${GCP_PROJECT_ID}" \
-  --quiet \
+scp_vm \
   --scp-flag="-p" \
   "${TMP_ENV}" \
   "${VM_NAME}:~/mcp-server/.env"
@@ -129,22 +195,22 @@ if [ -d "${REPO_ROOT}/servers" ]; then
     fi
   done
   if [ "${#SERVER_ENTRIES[@]}" -gt 0 ]; then
-    gcloud compute scp \
-      --zone="${GCP_ZONE}" \
-      --project="${GCP_PROJECT_ID}" \
-      --quiet \
+    scp_vm \
       --recurse \
       "${SERVER_ENTRIES[@]}" \
-      "${VM_NAME}:~/mcp-server/servers/"
+      "${VM_NAME}:~/mcp-server/servers.new/"
   fi
 fi
 
-echo "==> Locking permissions, validating config, and starting Docker Compose stack..."
+echo "==> Locking permissions, syncing servers/, validating config, and starting Docker Compose stack..."
 ssh_vm 'bash -s' <<'REMOTE_START'
 set -euo pipefail
 cd "$HOME/mcp-server"
 chmod 600 .env
 chmod 644 docker-compose.yml Caddyfile config.json
+
+rm -rf "$HOME/mcp-server/servers"
+mv "$HOME/mcp-server/servers.new" "$HOME/mcp-server/servers"
 
 sudo docker compose pull </dev/null
 sudo docker compose run -T --rm --no-deps mcp-proxy --config /config/config.json -check-config </dev/null
@@ -196,9 +262,6 @@ echo ""
 
 echo "==> Running full E2E integration tests & latency profiling..."
 E2E_CMD=(python3 "${SCRIPT_DIR}/e2e-test.py" --iterations "${E2E_ITERATIONS:-5}")
-if jq -e '.mcpServers.gemini' "${CONFIG_FILE}" >/dev/null 2>&1; then
-  E2E_CMD+=(--include-gemini)
-fi
 if [ -n "${E2E_EXTRA_ARGS:-}" ]; then
   read -r -a EXTRA_ARR <<< "${E2E_EXTRA_ARGS}"
   if [ "${#EXTRA_ARR[@]}" -gt 0 ]; then

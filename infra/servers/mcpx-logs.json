@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "mcpx-logs": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--script",
+        "/servers/mcpx-logs/server.py"
+      ],
+      "env": {
+        "MCPX_LOG_DIR": "/var/log/mcpx"
+      },
+      "timeout": "60s"
+    }
+  }
+}

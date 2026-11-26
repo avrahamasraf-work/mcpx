@@ -9,6 +9,7 @@ set -euo pipefail
 #   5. Wait until SSH is ready and print the reserved static IP for DNS configuration
 
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 GCP_PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID (e.g. from mcpx.agent.env)}"
 GCP_REGION="${GCP_REGION:-us-east1}"
@@ -19,6 +20,8 @@ MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
 DISK_SIZE="${DISK_SIZE:-30GB}"
 DISK_TYPE="${DISK_TYPE:-pd-standard}"
 MCP_SUBDOMAIN="${MCP_SUBDOMAIN:-${DOMAIN:-mcpx.duckdns.org}}"
+SSH_SOURCE_RANGES="${SSH_SOURCE_RANGES:-35.235.240.0/20}"
+USE_IAP_SSH="${USE_IAP_SSH:-0}"
 
 ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n 1 || true)"
 if [ -z "${ACTIVE_ACCOUNT}" ]; then
@@ -55,7 +58,7 @@ STATIC_IP="$(gcloud compute addresses describe "${STATIC_IP_NAME}" \
   --format='get(address)')"
 echo "    Static External IP: ${STATIC_IP}"
 
-echo "==> Ensuring firewall rules (HTTP 80, HTTPS 443, SSH 22)..."
+echo "==> Ensuring firewall rules (HTTP 80, HTTPS 443 TCP+UDP, SSH 22)..."
 if ! gcloud compute firewall-rules describe default-allow-http --project="${GCP_PROJECT_ID}" >/dev/null 2>&1 \
   && ! gcloud compute firewall-rules describe mcpx-allow-http --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
   gcloud compute firewall-rules create mcpx-allow-http \
@@ -70,8 +73,8 @@ if ! gcloud compute firewall-rules describe default-allow-http --project="${GCP_
     --quiet
 fi
 
-if ! gcloud compute firewall-rules describe default-allow-https --project="${GCP_PROJECT_ID}" >/dev/null 2>&1 \
-  && ! gcloud compute firewall-rules describe mcpx-allow-https --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
+# Always ensure mcpx-allow-https exists because GCP's default-allow-https only allows tcp:443 (not udp:443 for HTTP/3).
+if ! gcloud compute firewall-rules describe mcpx-allow-https --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
   gcloud compute firewall-rules create mcpx-allow-https \
     --project="${GCP_PROJECT_ID}" \
     --direction=INGRESS \
@@ -84,8 +87,7 @@ if ! gcloud compute firewall-rules describe default-allow-https --project="${GCP
     --quiet
 fi
 
-if ! gcloud compute firewall-rules describe default-allow-ssh --project="${GCP_PROJECT_ID}" >/dev/null 2>&1 \
-  && ! gcloud compute firewall-rules describe mcpx-allow-ssh --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
+if ! gcloud compute firewall-rules describe mcpx-allow-ssh --project="${GCP_PROJECT_ID}" >/dev/null 2>&1; then
   gcloud compute firewall-rules create mcpx-allow-ssh \
     --project="${GCP_PROJECT_ID}" \
     --direction=INGRESS \
@@ -93,7 +95,8 @@ if ! gcloud compute firewall-rules describe default-allow-ssh --project="${GCP_P
     --network=default \
     --action=ALLOW \
     --rules=tcp:22 \
-    --source-ranges=0.0.0.0/0 \
+    --source-ranges="${SSH_SOURCE_RANGES}" \
+    --target-tags=mcpx-ssh \
     --quiet
 fi
 
@@ -109,7 +112,7 @@ if ! gcloud compute instances describe "${VM_NAME}" \
     --boot-disk-size="${DISK_SIZE}" \
     --boot-disk-type="${DISK_TYPE}" \
     --address="${STATIC_IP}" \
-    --tags=http-server,https-server \
+    --tags=http-server,https-server,mcpx-ssh \
     --quiet
 else
   VM_STATUS="$(gcloud compute instances describe "${VM_NAME}" \
@@ -127,13 +130,18 @@ else
 fi
 
 echo "==> Waiting for SSH to become ready on '${VM_NAME}'..."
+SSH_IAP_ARGS=()
+if [ "${USE_IAP_SSH}" = "1" ]; then
+  SSH_IAP_ARGS+=(--tunnel-through-iap)
+fi
 LAST_SSH_ERR=""
 for attempt in $(seq 1 30); do
   if SSH_OUT="$(gcloud compute ssh "${VM_NAME}" \
     --zone="${GCP_ZONE}" \
     --project="${GCP_PROJECT_ID}" \
     --quiet \
-    --ssh-flag="-o ConnectTimeout=10 -o StrictHostKeyChecking=no" \
+    "${SSH_IAP_ARGS[@]}" \
+    --ssh-flag="-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new" \
     --command="echo ssh-ready" 2>&1)"; then
     echo "    SSH is ready!"
     break

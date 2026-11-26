@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "uv-time": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-time==2026.11.18"
+      ],
+      "timeout": "60s"
+    }
+  }
+}

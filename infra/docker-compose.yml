@@ -1,15 +1,48 @@
+# Docker Compose stack for the MCPX remote MCP gateway.
+# Runs the internal mcp-proxy gateway alongside the public Caddy HTTPS reverse proxy.
+# Shares the persistent mcpx-logs volume (/var/log/mcpx) across both services
+# so Caddy, mcp-proxy, and local MCP servers write logs to one place.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   mcp-proxy:
-    image: ghcr.io/tbxark/mcp-proxy:latest
+    # Pinned to v0.58.0: v1.1.0's 5s discoverProbeTimeout triggers an infinite
+    # 2025-11-25 vs 2026-07-28 protocol-mismatch retry loop on slow e2-micro stdio starts.
+    image: ghcr.io/tbxark/mcp-proxy:v0.58.0
     container_name: mcp-proxy
     restart: unless-stopped
+    mem_limit: 768m
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
     env_file:
       - .env
+    environment:
+      MCPX_LOG_DIR: /var/log/mcpx
+    entrypoint:
+      - /usr/bin/bash
+      - -c
+      - |
+        set -o pipefail
+        mkdir -p /var/log/mcpx/servers
+        if [ -f /var/log/mcpx/mcp-proxy.log ] && [ "$(wc -c < /var/log/mcpx/mcp-proxy.log)" -gt 10485760 ]; then
+          mv /var/log/mcpx/mcp-proxy.log /var/log/mcpx/mcp-proxy.log.1
+        fi
+        /main "$@" 2>&1 | tee -a /var/log/mcpx/mcp-proxy.log
+      - --
+    command:
+      - --config
+      - /config/config.json
     volumes:
       - ./config.json:/config/config.json:ro
       - ./servers:/servers:ro
       - uv-cache:/root/.cache/uv
       - npm-cache:/root/.npm
+      - mcpx-logs:/var/log/mcpx
     expose:
       - "9000"
     healthcheck:
@@ -28,9 +61,13 @@ services:
       - mcp-net
 
   caddy:
-    image: caddy:alpine
+    image: caddy:2.11.9-alpine
     container_name: caddy
     restart: unless-stopped
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
     env_file:
       - .env
     ports:
@@ -41,6 +78,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+      - mcpx-logs:/var/log/mcpx
     depends_on:
       mcp-proxy:
         condition: service_healthy
@@ -52,6 +90,7 @@ volumes:
   caddy-config:
   uv-cache:
   npm-cache:
+  mcpx-logs:
 
 networks:
   mcp-net:
