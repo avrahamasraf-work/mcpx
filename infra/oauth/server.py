@@ -10,6 +10,7 @@ refresh-token rotation, and `/oauth/verify` for dual static-Bearer / OAuth JWT a
 from __future__ import annotations
 
 import base64
+from collections import deque
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -21,13 +22,14 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import sys
 import threading
 import time
 import urllib.parse
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 SERVICE_NAME = "mcpx-oauth"
 DEFAULT_PORT = 9100
@@ -38,6 +40,30 @@ LOG_BACKUP_COUNT = 3
 DEFAULT_SCOPE = "mcp:tools"
 CSRF_TTL_SECONDS = 600
 MAX_REQUEST_BODY_BYTES = 64 * 1024
+
+# Resource bounds: concurrent connections, per-request socket timeout, and stored DCR clients.
+MAX_CONNECTIONS = 64
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_CLIENTS = 500
+MAX_REDIRECT_URIS = 10
+MAX_REDIRECT_URI_LENGTH = 512
+
+# Per-client-IP limits on public POST endpoints: bucket -> (max requests, window seconds).
+RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "authorize": (10, 60),
+    "register": (10, 3600),
+    "token": (60, 60),
+}
+RATE_LIMITED_PATHS = {
+    "/oauth/authorize": "authorize",
+    "/oauth/register": "register",
+    "/oauth/token": "token",
+}
+RATE_LIMIT_MAX_KEYS = 10_000
+
+# RFC 7636: S256 challenge is 43 base64url chars; verifier is 43-128 unreserved chars.
+PKCE_CHALLENGE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+PKCE_VERIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -55,6 +81,39 @@ def _sha256_hex(value: str) -> str:
 
 def _pkce_s256(code_verifier: str) -> str:
     return _b64url_encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+
+
+def _safe_equals(a: str, b: str) -> bool:
+    """Constant-time string compare that also accepts non-ASCII input."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+class RateLimiter:
+    """Thread-safe sliding-window request counter keyed by (bucket, client IP)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._hits: dict[tuple[str, str], deque[float]] = {}
+
+    def allow(self, bucket: str, client_ip: str) -> bool:
+        max_requests, window_seconds = RATE_LIMITS[bucket]
+        now = time.monotonic()
+        with self._lock:
+            if len(self._hits) > RATE_LIMIT_MAX_KEYS:
+                self._forget_stale(now)
+            hits = self._hits.setdefault((bucket, client_ip), deque())
+            while hits and hits[0] <= now - window_seconds:
+                hits.popleft()
+            if len(hits) >= max_requests:
+                return False
+            hits.append(now)
+            return True
+
+    def _forget_stale(self, now: float) -> None:
+        longest_window = max(window for _, window in RATE_LIMITS.values())
+        self._hits = {key: hits for key, hits in self._hits.items() if hits and hits[-1] > now - longest_window}
+        if len(self._hits) > RATE_LIMIT_MAX_KEYS:
+            self._hits.clear()
 
 
 def _configure_logging(log_dir: Path) -> logging.Logger:
@@ -88,10 +147,13 @@ def _configure_logging(log_dir: Path) -> logging.Logger:
 
 
 def _is_valid_redirect_uri(uri: str, allowed_hosts: set[str] | None = None) -> bool:
-    parsed = urllib.parse.urlsplit(uri)
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
     if parsed.fragment:
         return False
-    host = (parsed.hostname or "").lower()
     if not host:
         return False
     if parsed.scheme == "https":
@@ -104,7 +166,10 @@ def _is_valid_redirect_uri(uri: str, allowed_hosts: set[str] | None = None) -> b
 
 
 def _normalize_resource_url(url: str) -> str:
-    parsed = urllib.parse.urlsplit(url.strip())
+    try:
+        parsed = urllib.parse.urlsplit(url.strip())
+    except ValueError:
+        return ""
     if not parsed.scheme or not parsed.netloc:
         return ""
     path = parsed.path.rstrip("/")
@@ -209,6 +274,14 @@ class OAuthStore:
     ) -> None:
         secret_hash = _sha256_hex(client_secret) if client_secret else ""
         with self._lock, self._conn:
+            self._conn.execute(
+                """
+                DELETE FROM oauth_clients WHERE client_id IN (
+                    SELECT client_id FROM oauth_clients ORDER BY created_at DESC LIMIT -1 OFFSET ?
+                )
+                """,
+                (MAX_CLIENTS - 1,),
+            )
             self._conn.execute(
                 """
                 INSERT INTO oauth_clients (
@@ -344,7 +417,7 @@ class OAuthService:
         header_b64, payload_b64, sig_b64 = parts
         try:
             header = json.loads(_b64url_decode(header_b64))
-            if header.get("alg") != "HS256":
+            if not isinstance(header, dict) or header.get("alg") != "HS256":
                 return None
             expected_sig = _b64url_encode(
                 hmac.new(
@@ -353,17 +426,19 @@ class OAuthService:
                     hashlib.sha256,
                 ).digest()
             )
-            if not hmac.compare_digest(sig_b64, expected_sig):
+            if not _safe_equals(sig_b64, expected_sig):
                 return None
             payload = json.loads(_b64url_decode(payload_b64))
         except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(payload, dict):
             return None
 
         now = int(time.time())
         if payload.get("iss") != self.config.issuer:
             return None
         exp = payload.get("exp")
-        if not isinstance(exp, int) or exp < now:
+        if not isinstance(exp, int) or isinstance(exp, bool) or exp < now:
             return None
         return payload
 
@@ -384,13 +459,13 @@ class OAuthService:
         if not payload or payload.get("use") != "csrf":
             return False
         return (
-            hmac.compare_digest(str(payload.get("cid", "")), client_id)
-            and hmac.compare_digest(str(payload.get("uri", "")), redirect_uri)
-            and hmac.compare_digest(str(payload.get("cc", "")), code_challenge)
+            _safe_equals(str(payload.get("cid", "")), client_id)
+            and _safe_equals(str(payload.get("uri", "")), redirect_uri)
+            and _safe_equals(str(payload.get("cc", "")), code_challenge)
         )
 
     def resolve_client(self, client_id: str) -> Optional[dict[str, Any]]:
-        if self.config.static_client_id and hmac.compare_digest(client_id, self.config.static_client_id):
+        if self.config.static_client_id and _safe_equals(client_id, self.config.static_client_id):
             return {
                 "client_id": self.config.static_client_id,
                 "client_secret_hash": _sha256_hex(self.config.static_client_secret)
@@ -414,7 +489,7 @@ class OAuthService:
             return True
         if not provided_secret:
             return False
-        return hmac.compare_digest(_sha256_hex(provided_secret), expected_hash)
+        return _safe_equals(_sha256_hex(provided_secret), expected_hash)
 
     def issue_token_pair(self, client_id: str, scope: str, resource: str) -> dict[str, Any]:
         now = int(time.time())
@@ -450,7 +525,7 @@ class OAuthService:
 
     def verify_request_token(self, token: str, forwarded_uri: str) -> tuple[bool, str]:
         """Validate either the static MCP_BEARER_TOKEN or an OAuth 2.1 access JWT."""
-        if hmac.compare_digest(token, self.config.bearer_token):
+        if _safe_equals(token, self.config.bearer_token):
             return True, "static-bearer"
 
         payload = self.verify_jwt(token)
@@ -577,12 +652,19 @@ def _render_consent_page(
 """
 
 
-def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
+def _make_handler(service: OAuthService, rate_limiter: RateLimiter) -> type[BaseHTTPRequestHandler]:
     class OAuthHandler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+        # One request per connection + socket timeout: slow or idle clients cannot pin worker threads.
+        protocol_version = "HTTP/1.0"
+        timeout = REQUEST_TIMEOUT_SECONDS
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             service.logger.debug("http %s", format % args)
+
+        def _client_ip(self) -> str:
+            # Caddy replaces X-Forwarded-For from untrusted clients, so its first value is the real peer.
+            forwarded_for = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            return forwarded_for or self.client_address[0]
 
         def _send_cors_headers(self) -> None:
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -630,8 +712,9 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
 
         def _read_body(self) -> bytes:
             length = int(self.headers.get("Content-Length") or "0")
-            if length > MAX_REQUEST_BODY_BYTES:
-                raise ValueError("Request body too large")
+            if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+                self.close_connection = True
+                raise ValueError("Invalid request body length")
             return self.rfile.read(length) if length > 0 else b""
 
         def _extract_basic_client_auth(self) -> tuple[str, str]:
@@ -646,9 +729,29 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
                 return "", ""
 
         def do_OPTIONS(self) -> None:  # noqa: N802
-            self._send_empty(HTTPStatus.NO_CONTENT)
+            self._run_safely(lambda: self._send_empty(HTTPStatus.NO_CONTENT))
 
         def do_GET(self) -> None:  # noqa: N802
+            self._run_safely(self._route_get)
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._run_safely(self._route_post)
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._run_safely(self._route_delete)
+
+        def _run_safely(self, route: Callable[[], None]) -> None:
+            """Turn any unexpected error into a logged 500 instead of a dropped connection."""
+            try:
+                route()
+            except Exception:  # noqa: BLE001
+                service.logger.exception("Unhandled error on %s %r", self.command, self.path)
+                try:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "server_error"})
+                except OSError:
+                    pass
+
+        def _route_get(self) -> None:
             parsed = urllib.parse.urlsplit(self.path)
             path = parsed.path
 
@@ -686,9 +789,19 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-        def do_POST(self) -> None:  # noqa: N802
-            parsed = urllib.parse.urlsplit(self.path)
-            path = parsed.path
+        def _route_post(self) -> None:
+            path = urllib.parse.urlsplit(self.path).path
+
+            bucket = RATE_LIMITED_PATHS.get(path)
+            if bucket and not rate_limiter.allow(bucket, self._client_ip()):
+                service.logger.warning("Rate limited %s from %s", path, self._client_ip())
+                _, window_seconds = RATE_LIMITS[bucket]
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"error": "rate_limited"},
+                    extra_headers={"Retry-After": str(window_seconds)},
+                )
+                return
 
             if path == "/oauth/verify":
                 self._handle_verify()
@@ -708,7 +821,7 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
 
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
-        def do_DELETE(self) -> None:  # noqa: N802
+        def _route_delete(self) -> None:
             if urllib.parse.urlsplit(self.path).path == "/oauth/verify":
                 self._handle_verify()
                 return
@@ -749,23 +862,32 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
             try:
                 body = json.loads(self._read_body().decode("utf-8") or "{}")
             except (ValueError, UnicodeDecodeError):
+                body = None
+            if not isinstance(body, dict):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_client_metadata"})
                 return
 
             redirect_uris = body.get("redirect_uris")
-            if not isinstance(redirect_uris, list) or not redirect_uris:
+            if not isinstance(redirect_uris, list) or not 0 < len(redirect_uris) <= MAX_REDIRECT_URIS:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
-                    {"error": "invalid_redirect_uri", "error_description": "redirect_uris must be a non-empty list"},
+                    {
+                        "error": "invalid_redirect_uri",
+                        "error_description": f"redirect_uris must be a list of 1-{MAX_REDIRECT_URIS} URIs",
+                    },
                 )
                 return
 
             cleaned_uris: list[str] = []
             for uri in redirect_uris:
-                if not isinstance(uri, str) or not _is_valid_redirect_uri(uri):
+                if (
+                    not isinstance(uri, str)
+                    or len(uri) > MAX_REDIRECT_URI_LENGTH
+                    or not _is_valid_redirect_uri(uri)
+                ):
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
-                        {"error": "invalid_redirect_uri", "error_description": f"Invalid redirect_uri: {uri!r}"},
+                        {"error": "invalid_redirect_uri", "error_description": "Invalid redirect_uri"},
                     )
                     return
                 cleaned_uris.append(uri)
@@ -820,7 +942,7 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
                 return None, "Unknown client_id."
             if not redirect_uri or not service.is_redirect_allowed(client, redirect_uri):
                 return None, "Invalid or unregistered redirect_uri."
-            if not code_challenge or code_challenge_method != "S256":
+            if code_challenge_method != "S256" or not PKCE_CHALLENGE_PATTERN.fullmatch(code_challenge):
                 return None, "PKCE with code_challenge_method=S256 is required."
             return client, None
 
@@ -889,7 +1011,7 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
                 return
 
             password = params.get("password", "")
-            if not hmac.compare_digest(password, service.config.consent_password):
+            if not _safe_equals(password, service.config.consent_password):
                 service.logger.warning("Failed consent authentication client_id=%s", params["client_id"])
                 csrf_token = service.make_csrf_token(
                     params["client_id"],
@@ -934,9 +1056,11 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
             if "application/json" in ctype:
                 try:
                     data = json.loads(raw or "{}")
-                    return {str(k): str(v) for k, v in data.items() if v is not None}
                 except ValueError:
                     return None
+                if not isinstance(data, dict):
+                    return None
+                return {str(k): str(v) for k, v in data.items() if v is not None}
             return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
 
         def _handle_token(self) -> None:
@@ -966,7 +1090,9 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
                 if record["client_id"] != client_id or record["redirect_uri"] != redirect_uri:
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant"})
                     return
-                if not code_verifier or not hmac.compare_digest(_pkce_s256(code_verifier), record["code_challenge"]):
+                if not PKCE_VERIFIER_PATTERN.fullmatch(code_verifier) or not _safe_equals(
+                    _pkce_s256(code_verifier), record["code_challenge"]
+                ):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant"})
                     return
 
@@ -1004,13 +1130,35 @@ def _make_handler(service: OAuthService) -> type[BaseHTTPRequestHandler]:
     return OAuthHandler
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Thread-per-request server that drops new connections once MAX_CONNECTIONS are busy."""
+
+    daemon_threads = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def main() -> int:
     config = OAuthConfig()
     logger = _configure_logging(config.log_dir)
     store = OAuthStore(config.db_path)
     service = OAuthService(config, store, logger)
 
-    server = ThreadingHTTPServer(("0.0.0.0", config.port), _make_handler(service))
+    server = BoundedThreadingHTTPServer(("0.0.0.0", config.port), _make_handler(service, RateLimiter()))
     logger.info(
         "Starting %s on :%d (issuer=%s, static_client=%s)",
         SERVICE_NAME,
