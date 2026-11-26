@@ -1,6 +1,7 @@
 {
-  "mcpServers": {
+  "servers": {
     "gemini-sound": {
+      "enabled": true,
       "command": "uv",
       "args": [
         "run",
@@ -14,7 +15,7 @@
         "GEMINI_USE_VERTEXAI": "${GEMINI_USE_VERTEXAI}",
         "MCPX_LOG_DIR": "/var/log/mcpx"
       },
-      "timeout": "120s"
+      "timeout": 120
     }
   }
 }

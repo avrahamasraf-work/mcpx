@@ -1,0 +1,23 @@
+# Package metadata and dependencies for the custom Python MCPX gateway.
+# Fits into MCPX as the build manifest installed inside infra/gateway/Dockerfile
+# so mcpx-gateway runs as an internal Docker Compose service behind Caddy.
+# Declares the official MCP Python SDK, Starlette ASGI, Uvicorn, and HTTPX.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcpx-gateway"
+version = "1.0.0"
+description = "MCPX remote MCP gateway aggregating stdio and Streamable HTTP upstream servers."
+requires-python = ">=3.13"
+dependencies = [
+    "mcp>=1.26,<2",
+    "starlette>=0.46",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+]
+
+[tool.setuptools.packages.find]
+include = ["mcpx_gateway*"]

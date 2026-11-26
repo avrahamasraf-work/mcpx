@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Registry and config builder for MCP servers deployed to the MCPX gateway.
-# Declares the enabled server list, merges infra/config.json with each
-# infra/servers/<name>.json definition, and delegates deployment to deploy-vm.sh.
+# Config builder and deployment entrypoint for MCP servers and tool groups.
+# Discovers enabled servers in infra/servers/*.json and enabled groups in
+# infra/groups/*.json (via each file's "enabled" flag), merges them with
+# infra/config.json, validates group references, and delegates to deploy-vm.sh.
 
 set -euo pipefail
 
@@ -9,43 +10,74 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BASE_CONFIG="${REPO_ROOT}/infra/config.json"
 SERVERS_DIR="${REPO_ROOT}/infra/servers"
-
-# Single source of truth for which servers in infra/servers/ are deployed.
-# Override at runtime with space-separated MCP_SERVERS="context7 uv-time".
-ENABLED_SERVERS=(
-  context7
-  uv-time
-  gemini-sound
-  mcpx-logs
-)
-
-if [ -n "${MCP_SERVERS:-}" ]; then
-  read -r -a ENABLED_SERVERS <<< "${MCP_SERVERS}"
-fi
+GROUPS_DIR="${REPO_ROOT}/infra/groups"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/mcp-servers.sh <command> [args]
 
-Manage enabled MCP servers and build the merged mcp-proxy config.
+Build the merged mcpx-gateway config from static JSON files in infra/servers/
+and infra/groups/ (controlled by each entry's "enabled" boolean, default true).
 
 Commands:
   list                        Print enabled server names (one per line)
-  build-config [output_path]  Merge infra/config.json + infra/servers/<name>.json
-                              and write validated JSON to output_path or stdout
+  list-groups                 Print enabled group names (one per line)
+  build-config [output_path]  Merge infra/config.json + enabled infra/servers/*.json
+                              + enabled infra/groups/*.json, validate group server
+                              references, and write JSON to output_path or stdout
   start | deploy              Build config to a temp file and run scripts/deploy-vm.sh
   -h | --help                 Show this help message
-
-Environment:
-  MCP_SERVERS                 Optional space-separated list overriding ENABLED_SERVERS
 EOF
 }
 
+collect_json_files() {
+  local dir="$1"
+  local file
+  if [ -d "${dir}" ]; then
+    for file in "${dir}"/*.json; do
+      [ -f "${file}" ] || continue
+      jq empty "${file}"
+      printf '%s\n' "${file}"
+    done
+  fi
+}
+
 cmd_list() {
-  local name
-  for name in "${ENABLED_SERVERS[@]}"; do
-    printf '%s\n' "${name}"
-  done
+  local files=()
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${SERVERS_DIR}")
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  jq -rs '
+    reduce .[] as $item ({}; . * ($item.servers // {})) |
+    to_entries[] |
+    select((.value.enabled // true) == true) |
+    .key
+  ' "${files[@]}"
+}
+
+cmd_list_groups() {
+  local files=()
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${GROUPS_DIR}")
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  jq -rs '
+    reduce .[] as $item ({}; . * ($item.groups // {})) |
+    to_entries[] |
+    select((.value.enabled // true) == true) |
+    .key
+  ' "${files[@]}"
 }
 
 cmd_build_config() {
@@ -54,24 +86,44 @@ cmd_build_config() {
     echo "ERROR: Base config not found: ${BASE_CONFIG}" >&2
     exit 1
   fi
+  jq empty "${BASE_CONFIG}"
 
   local files=("${BASE_CONFIG}")
-  local name server_file
-  for name in "${ENABLED_SERVERS[@]}"; do
-    server_file="${SERVERS_DIR}/${name}.json"
-    if [ ! -f "${server_file}" ]; then
-      echo "ERROR: Server config not found: ${server_file}" >&2
-      exit 1
-    fi
-    jq empty "${server_file}"
-    files+=("${server_file}")
-  done
+  local file
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${SERVERS_DIR}")
+  while IFS= read -r file; do
+    [ -n "${file}" ] && files+=("${file}")
+  done < <(collect_json_files "${GROUPS_DIR}")
+
+  local merged
+  merged="$(jq -s '
+    reduce .[] as $item ({}; . * $item) |
+    .servers = ((.servers // {}) | with_entries(select((.value.enabled // true) == true))) |
+    .groups  = ((.groups  // {}) | with_entries(select((.value.enabled // true) == true)))
+  ' "${files[@]}")"
+
+  local missing
+  missing="$(printf '%s\n' "${merged}" | jq -r '
+    (.servers // {}) as $servers |
+    (.groups // {}) | to_entries[] |
+    .key as $group |
+    (.value.servers // {}) | keys[] |
+    . as $srv |
+    select(($servers | has($srv)) | not) |
+    "\($group):\($srv)"
+  ')"
+  if [ -n "${missing}" ]; then
+    echo "ERROR: Group config references unknown or disabled server(s): ${missing}" >&2
+    exit 1
+  fi
 
   if [ -n "${output_path}" ]; then
-    jq -s 'reduce .[] as $item ({}; . * $item)' "${files[@]}" > "${output_path}"
+    printf '%s\n' "${merged}" > "${output_path}"
     jq empty "${output_path}"
   else
-    jq -s 'reduce .[] as $item ({}; . * $item)' "${files[@]}"
+    printf '%s\n' "${merged}"
   fi
 }
 
@@ -95,6 +147,9 @@ COMMAND="${1:-}"
 case "${COMMAND}" in
   list)
     cmd_list
+    ;;
+  list-groups)
+    cmd_list_groups
     ;;
   build-config)
     shift

@@ -1,19 +1,16 @@
 {
-  "mcpProxy": {
-    "baseURL": "https://${MCP_SUBDOMAIN}",
-    "addr": ":9000",
+  "gateway": {
     "name": "MCPX Gateway",
     "version": "1.0.0",
-    "type": "streamable-http",
-    "startupGracePeriod": "90s",
-    "options": {
-      "panicIfInvalid": false,
-      "logEnabled": true,
-      "autoReconnect": true,
-      "authTokens": [
-        "${MCP_BEARER_TOKEN}"
-      ]
-    }
+    "host": "0.0.0.0",
+    "port": 9000,
+    "startupGracePeriod": 90,
+    "pingInterval": 30,
+    "reconnectInterval": 15,
+    "authTokens": [
+      "${MCP_BEARER_TOKEN}"
+    ]
   },
-  "mcpServers": {}
+  "servers": {},
+  "groups": {}
 }

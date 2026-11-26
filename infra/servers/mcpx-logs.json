@@ -1,6 +1,7 @@
 {
-  "mcpServers": {
+  "servers": {
     "mcpx-logs": {
+      "enabled": true,
       "command": "uv",
       "args": [
         "run",
@@ -10,7 +11,7 @@
       "env": {
         "MCPX_LOG_DIR": "/var/log/mcpx"
       },
-      "timeout": "60s"
+      "timeout": 60
     }
   }
 }

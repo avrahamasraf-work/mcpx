@@ -6,7 +6,7 @@
 # ///
 """MCPX stdio MCP server for inspecting gateway and per-server log files.
 
-Launched by mcp-proxy via `uv run --script /servers/mcpx-logs/server.py` and
+Launched by mcpx-gateway via `uv run --script /servers/mcpx-logs/server.py` and
 exposed behind Caddy HTTPS + Bearer auth at `/mcpx-logs/mcp`. Provides read-only
 access to `<MCPX_LOG_DIR>` logs with strict source validation and secret redaction.
 """
@@ -32,7 +32,7 @@ MIN_LINES = 1
 MAX_LINES = 1000
 
 GATEWAY_LOG_FILES: dict[str, str] = {
-    "mcp-proxy": "mcp-proxy.log",
+    "mcpx-gateway": "mcpx-gateway.log",
     "caddy": "caddy.log",
     "mcpx-oauth": "mcpx-oauth.log",
 }
@@ -179,7 +179,7 @@ def get_logs(source: str, lines: int = 100, search: str | None = None) -> str:
     """Read recent redacted lines from a gateway or MCP server log file.
 
     Args:
-        source: Log source name (`mcp-proxy`, `caddy`, or an MCP server name).
+        source: Log source name (`mcpx-gateway`, `caddy`, `mcpx-oauth`, or an MCP server name).
         lines: Maximum number of trailing lines to return (clamped to 1..1000).
         search: Optional case-insensitive substring filter.
     """
@@ -198,11 +198,11 @@ def get_logs(source: str, lines: int = 100, search: str | None = None) -> str:
         if server_log_path.is_file():
             target_path = server_log_path
         else:
-            target_path = log_dir / GATEWAY_LOG_FILES["mcp-proxy"]
+            target_path = log_dir / GATEWAY_LOG_FILES["mcpx-gateway"]
             required_substring = validated_source
             header = (
                 f"# No dedicated log file for '{validated_source}'; "
-                f"showing lines matching '{validated_source}' from mcp-proxy.log"
+                f"showing lines matching '{validated_source}' from mcpx-gateway.log"
             )
 
     if not target_path.is_file():

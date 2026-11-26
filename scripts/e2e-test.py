@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Live end-to-end integration tests and latency profiler for the MCPX HTTPS gateway.
+"""Live end-to-end integration tests and latency profiler for mcpx-gateway.
 
 Fits into MCPX as the automated verification step run after `scripts/deploy-vm.sh` or
-`scripts/mcp-servers.sh deploy`, and standalone by operators to validate the live gateway.
-Exercises real HTTPS/TLS auth, `/_healthz` & `/_readyz`, every enabled MCP server
-(`uv-time`, `context7`, `mcpx-logs`, `gemini-sound`), and multi-iteration p95 latency budgets.
+`scripts/mcp-servers.sh deploy`, and standalone against HTTPS or local `:9000`.
+Exercises auth, OAuth 2.1, `/_healthz` & `/_readyz`, `/mcp` (unified), `/<server>/mcp`,
+`/groups/<group>/mcp`, and multi-iteration p95 latency budgets.
 """
 
 from __future__ import annotations
@@ -204,7 +204,12 @@ class McpStreamableClient:
             hdrs["Mcp-Session-Id"] = self.session_id
         return hdrs
 
-    def rpc(self, method: str, params: Optional[dict[str, Any]] = None) -> tuple[dict[str, Any], float]:
+    def rpc(
+        self,
+        method: str,
+        params: Optional[dict[str, Any]] = None,
+        allow_error: bool = False,
+    ) -> tuple[dict[str, Any], float]:
         self._req_id += 1
         payload: dict[str, Any] = {
             "jsonrpc": "2.0",
@@ -229,7 +234,7 @@ class McpStreamableClient:
             self.session_id = res.headers["mcp-session-id"]
 
         parsed = parse_mcp_response(res)
-        if "error" in parsed:
+        if "error" in parsed and not allow_error:
             raise AssertionError(f"MCP RPC {method} returned JSON-RPC error: {parsed['error']}")
         return parsed, res.elapsed_ms
 
@@ -273,6 +278,7 @@ class McpStreamableClient:
 
 
 DEFAULT_SERVERS = ["context7", "uv-time", "gemini-sound", "mcpx-logs"]
+DEFAULT_GROUPS = ["ops"]
 
 
 def discover_enabled_servers() -> list[str]:
@@ -294,37 +300,102 @@ def discover_enabled_servers() -> list[str]:
     return list(DEFAULT_SERVERS)
 
 
-def run_security_and_health_checks(base_url: str, token: str, probe_server: str) -> None:
+def discover_enabled_groups() -> list[str]:
+    """Query `scripts/mcp-servers.sh list-groups` for enabled groups, falling back to defaults."""
+    helper = Path(__file__).resolve().parent / "mcp-servers.sh"
+    if helper.is_file():
+        try:
+            out = subprocess.check_output(
+                ["bash", str(helper), "list-groups"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            return [line.strip() for line in out.splitlines() if line.strip()]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return list(DEFAULT_GROUPS)
+
+
+def _assert_rfc9728_challenge(res: HttpResult, label: str) -> str:
+    www_auth = res.headers.get("www-authenticate", "")
+    match = re.search(r'resource_metadata="([^"]+)"', www_auth)
+    assert match, f"Missing RFC 9728 resource_metadata in WWW-Authenticate for {label}: {www_auth!r}"
+    return match.group(1)
+
+
+def run_security_and_health_checks(
+    base_url: str,
+    token: str,
+    probe_server: str,
+    probe_group: Optional[str],
+    skip_oauth: bool,
+) -> None:
     print("==> Security & Auth integration tests")
+    rpc_probe = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
 
-    r_no_auth = http_request(f"{base_url}/_healthz")
-    assert r_no_auth.status == 401, f"Expected 401 for unauthenticated /_healthz, got {r_no_auth.status}"
-    print(f"    PASS  GET /_healthz (no token)          -> HTTP {r_no_auth.status} ({r_no_auth.elapsed_ms:.1f} ms)")
+    if not skip_oauth:
+        r_no_auth = http_request(f"{base_url}/_healthz")
+        assert r_no_auth.status == 401, f"Expected 401 for unauthenticated /_healthz, got {r_no_auth.status}"
+        _assert_rfc9728_challenge(r_no_auth, "GET /_healthz")
+        print(f"    PASS  GET /_healthz (no token)              -> HTTP 401 + RFC 9728 ({r_no_auth.elapsed_ms:.1f} ms)")
 
-    r_bad_auth = http_request(f"{base_url}/_healthz", headers={"Authorization": "Bearer invalid-token"})
-    assert r_bad_auth.status == 401, f"Expected 401 for bad token on /_healthz, got {r_bad_auth.status}"
-    print(f"    PASS  GET /_healthz (wrong token)       -> HTTP {r_bad_auth.status} ({r_bad_auth.elapsed_ms:.1f} ms)")
+        r_bad_auth = http_request(f"{base_url}/_healthz", headers={"Authorization": "Bearer invalid-token"})
+        assert r_bad_auth.status == 401, f"Expected 401 for bad token on /_healthz, got {r_bad_auth.status}"
+        _assert_rfc9728_challenge(r_bad_auth, "GET /_healthz (bad token)")
+        print(f"    PASS  GET /_healthz (wrong token)           -> HTTP 401 + RFC 9728 ({r_bad_auth.elapsed_ms:.1f} ms)")
 
-    r_mcp_no_auth = http_request(
-        f"{base_url}/{probe_server}/mcp",
-        method="POST",
-        payload={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    r_unified_no_auth = http_request(f"{base_url}/mcp", method="POST", payload=rpc_probe)
+    assert r_unified_no_auth.status == 401, (
+        f"Expected 401 for unauthenticated /mcp, got {r_unified_no_auth.status}"
     )
+    if not skip_oauth:
+        _assert_rfc9728_challenge(r_unified_no_auth, "POST /mcp")
+    print(f"    PASS  POST /mcp (no token)                  -> HTTP 401 ({r_unified_no_auth.elapsed_ms:.1f} ms)")
+
+    if skip_oauth:
+        r_unified_bad_auth = http_request(
+            f"{base_url}/mcp",
+            method="POST",
+            headers={"Authorization": "Bearer invalid-token"},
+            payload=rpc_probe,
+        )
+        assert r_unified_bad_auth.status == 401, (
+            f"Expected 401 for bad token on /mcp, got {r_unified_bad_auth.status}"
+        )
+        print(f"    PASS  POST /mcp (wrong token)               -> HTTP 401 ({r_unified_bad_auth.elapsed_ms:.1f} ms)")
+
+    r_mcp_no_auth = http_request(f"{base_url}/{probe_server}/mcp", method="POST", payload=rpc_probe)
     assert r_mcp_no_auth.status == 401, (
         f"Expected 401 for unauthenticated /{probe_server}/mcp, got {r_mcp_no_auth.status}"
     )
+    if not skip_oauth:
+        _assert_rfc9728_challenge(r_mcp_no_auth, f"POST /{probe_server}/mcp")
     print(
-        f"    PASS  POST /{probe_server}/mcp (no token) -> HTTP {r_mcp_no_auth.status} ({r_mcp_no_auth.elapsed_ms:.1f} ms)"
+        f"    PASS  POST /{probe_server}/mcp (no token)     -> HTTP 401 ({r_mcp_no_auth.elapsed_ms:.1f} ms)"
     )
+
+    if probe_group:
+        r_grp_no_auth = http_request(f"{base_url}/groups/{probe_group}/mcp", method="POST", payload=rpc_probe)
+        assert r_grp_no_auth.status == 401, (
+            f"Expected 401 for unauthenticated /groups/{probe_group}/mcp, got {r_grp_no_auth.status}"
+        )
+        if not skip_oauth:
+            _assert_rfc9728_challenge(r_grp_no_auth, f"POST /groups/{probe_group}/mcp")
+        print(
+            f"    PASS  POST /groups/{probe_group}/mcp (no token) -> HTTP 401 ({r_grp_no_auth.elapsed_ms:.1f} ms)"
+        )
 
     auth_headers = {"Authorization": f"Bearer {token}"}
     r_health = http_request(f"{base_url}/_healthz", headers=auth_headers)
     assert r_health.status == 200, f"Expected 200 for /_healthz with token, got {r_health.status}: {r_health.body}"
     health_json = json.loads(r_health.body)
     assert health_json.get("status") == "ok", f"Unexpected /_healthz payload: {health_json}"
+    assert isinstance(health_json.get("serverCount"), int), f"Missing serverCount in /_healthz: {health_json}"
+    assert isinstance(health_json.get("groupCount"), int), f"Missing groupCount in /_healthz: {health_json}"
     print(
-        f"    PASS  GET /_healthz (authorized)        -> HTTP 200 ({r_health.elapsed_ms:.1f} ms) "
-        f"servers={health_json.get('serverCount')}"
+        f"    PASS  GET /_healthz (authorized)            -> HTTP 200 ({r_health.elapsed_ms:.1f} ms) "
+        f"servers={health_json.get('serverCount')} groups={health_json.get('groupCount')}"
     )
 
     r_ready = http_request(f"{base_url}/_readyz", headers=auth_headers)
@@ -332,12 +403,17 @@ def run_security_and_health_checks(base_url: str, token: str, probe_server: str)
     ready_json = json.loads(r_ready.body)
     assert not ready_json.get("unhealthy"), f"Unhealthy servers reported: {ready_json}"
     print(
-        f"    PASS  GET /_readyz (authorized)         -> HTTP 200 ({r_ready.elapsed_ms:.1f} ms) "
+        f"    PASS  GET /_readyz (authorized)             -> HTTP 200 ({r_ready.elapsed_ms:.1f} ms) "
         f"status={ready_json.get('status')}"
     )
 
 
-def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> None:
+def run_oauth_e2e(
+    base_url: str,
+    consent_password: str,
+    probe_server: str,
+    probe_group: Optional[str],
+) -> None:
     print("\n==> E2E test: MCP Authorization (OAuth 2.1 discovery, DCR, PKCE, JWT, refresh, revoke)")
 
     # 1. Internal forward_auth verifier must not be publicly reachable.
@@ -346,17 +422,13 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
     print(f"    PASS  GET /oauth/verify (public blocked) -> HTTP 404 ({r_verify.elapsed_ms:.1f} ms)")
 
     # 2. Unauthenticated MCP call must advertise RFC 9728 resource_metadata.
-    resource_url = f"{base_url}/{probe_server}/mcp"
     r_unauth = http_request(
-        resource_url,
+        f"{base_url}/mcp",
         method="POST",
         payload={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
     )
-    assert r_unauth.status == 401, f"Expected 401 for unauthenticated {resource_url}, got {r_unauth.status}"
-    www_auth = r_unauth.headers.get("www-authenticate", "")
-    match = re.search(r'resource_metadata="([^"]+)"', www_auth)
-    assert match, f"Missing resource_metadata in WWW-Authenticate header: {www_auth!r}"
-    metadata_url = match.group(1)
+    assert r_unauth.status == 401, f"Expected 401 for unauthenticated /mcp, got {r_unauth.status}"
+    metadata_url = _assert_rfc9728_challenge(r_unauth, "POST /mcp")
 
     # 3. Protected Resource Metadata (RFC 9728) -> Authorization Server Metadata (RFC 8414).
     r_prm = http_request(metadata_url)
@@ -391,7 +463,7 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
     client_id = json.loads(r_reg.body)["client_id"]
     print(f"    PASS  POST /oauth/register (DCR)         -> client_id={client_id}")
 
-    # 5. Authorization Code + PKCE (S256) consent flow.
+    # 5. Authorization Code + PKCE (S256) consent flow (gateway-scoped resource=issuer).
     code_verifier = secrets.token_urlsafe(48)
     code_challenge = base64.urlsafe_b64encode(
         hashlib.sha256(code_verifier.encode("ascii")).digest()
@@ -405,7 +477,7 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
             "redirect_uri": redirect_uri,
             "state": state,
             "scope": "mcp:tools",
-            "resource": resource_url,
+            "resource": issuer,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
@@ -423,7 +495,7 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
             "redirect_uri": redirect_uri,
             "state": state,
             "scope": "mcp:tools",
-            "resource": resource_url,
+            "resource": issuer,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "password": consent_password,
@@ -451,7 +523,7 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
-            "resource": resource_url,
+            "resource": issuer,
         }
     ).encode("utf-8")
     r_tok = http_request(
@@ -466,15 +538,24 @@ def run_oauth_e2e(base_url: str, consent_password: str, probe_server: str) -> No
     refresh_token = tok_json["refresh_token"]
     print(f"    PASS  OAuth 2.1 PKCE code -> JWT         -> token_type={tok_json.get('token_type')}")
 
-    # 7. Real MCP initialize + tools/list authenticated ONLY by the OAuth 2.1 JWT.
-    oauth_client = McpStreamableClient(resource_url, access_token)
-    init_ms = oauth_client.initialize()
-    tools, list_ms = oauth_client.list_tools()
-    assert tools, f"Expected non-empty tools list via OAuth JWT on {probe_server}"
-    print(
-        f"    PASS  MCP via OAuth JWT ({probe_server}) -> "
-        f"init={init_ms:.1f}ms tools/list={list_ms:.1f}ms count={len(tools)}"
-    )
+    # 7. Real MCP initialize + tools/list authenticated ONLY by the OAuth 2.1 JWT
+    #    across unified (/mcp), per-server (/<probe>/mcp), and group (/groups/<group>/mcp).
+    jwt_targets = [
+        ("unified /mcp", f"{base_url}/mcp"),
+        (f"/{probe_server}/mcp", f"{base_url}/{probe_server}/mcp"),
+    ]
+    if probe_group:
+        jwt_targets.append((f"/groups/{probe_group}/mcp", f"{base_url}/groups/{probe_group}/mcp"))
+
+    for label, target_url in jwt_targets:
+        oauth_client = McpStreamableClient(target_url, access_token)
+        init_ms = oauth_client.initialize()
+        tools, list_ms = oauth_client.list_tools()
+        assert tools, f"Expected non-empty tools list via OAuth JWT on {label}"
+        print(
+            f"    PASS  MCP via OAuth JWT ({label}) -> "
+            f"init={init_ms:.1f}ms tools/list={list_ms:.1f}ms count={len(tools)}"
+        )
 
     # 8. Refresh token rotation & replay protection.
     refresh_body = urllib.parse.urlencode(
@@ -574,9 +655,9 @@ def run_mcpx_logs_e2e(base_url: str, token: str) -> McpStreamableClient:
     sources_text = " ".join(str(c.get("text", "")) for c in sources_res.get("content", [])).strip()
     assert sources_text, f"Expected non-empty log sources output, got: {sources_res}"
 
-    proxy_res, proxy_ms = client.call_tool("get_logs", {"source": "mcp-proxy", "lines": 20})
-    assert not proxy_res.get("isError"), f"mcpx-logs get_logs(mcp-proxy) returned error: {proxy_res}"
-    assert proxy_res.get("content"), f"Expected content from get_logs(mcp-proxy), got: {proxy_res}"
+    gw_res, gw_ms = client.call_tool("get_logs", {"source": "mcpx-gateway", "lines": 20})
+    assert not gw_res.get("isError"), f"mcpx-logs get_logs(mcpx-gateway) returned error: {gw_res}"
+    assert gw_res.get("content"), f"Expected content from get_logs(mcpx-gateway), got: {gw_res}"
 
     self_res, self_ms = client.call_tool("get_logs", {"source": "mcpx-logs", "lines": 20})
     assert not self_res.get("isError"), f"mcpx-logs get_logs(mcpx-logs) returned error: {self_res}"
@@ -584,7 +665,7 @@ def run_mcpx_logs_e2e(base_url: str, token: str) -> McpStreamableClient:
 
     print(
         f"    PASS  mcpx-logs initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
-        f"list_log_sources={sources_ms:.1f}ms get_logs(mcp-proxy)={proxy_ms:.1f}ms "
+        f"list_log_sources={sources_ms:.1f}ms get_logs(mcpx-gateway)={gw_ms:.1f}ms "
         f"get_logs(mcpx-logs)={self_ms:.1f}ms tools={tool_names}"
     )
     return client
@@ -658,10 +739,141 @@ def run_generic_server_e2e(base_url: str, token: str, server_name: str) -> McpSt
     return client
 
 
+def run_unified_e2e(base_url: str, token: str, active_servers: list[str]) -> McpStreamableClient:
+    print("\n==> E2E test: unified /mcp (all enabled servers namespaced as <server>__<tool>)")
+    client = McpStreamableClient(f"{base_url}/mcp", token)
+    init_ms = client.initialize()
+    tools, list_ms = client.list_tools()
+    tool_names = [t.get("name", "") for t in tools]
+
+    for srv in active_servers:
+        prefix = f"{srv}__"
+        assert any(name.startswith(prefix) for name in tool_names), (
+            f"Expected at least one '{prefix}*' tool on /mcp for enabled server '{srv}', got {tool_names}"
+        )
+
+    expected_by_server = {
+        "uv-time": ["uv-time__get_current_time"],
+        "mcpx-logs": ["mcpx-logs__list_log_sources", "mcpx-logs__get_logs"],
+        "context7": ["context7__resolve-library-id"],
+        "gemini-sound": ["gemini-sound__gemini_sound_list_voices", "gemini-sound__gemini_generate_sound"],
+    }
+    for srv in active_servers:
+        for expected in expected_by_server.get(srv, []):
+            assert expected in tool_names, f"Expected '{expected}' on /mcp, got {tool_names}"
+
+    call_timings: list[str] = []
+    if "uv-time" in active_servers:
+        res, ms = client.call_tool("uv-time__get_current_time", {"timezone": "UTC"})
+        assert not res.get("isError"), f"unified uv-time__get_current_time failed: {res}"
+        content = res.get("content", [])
+        assert content and any("UTC" in str(c.get("text", "")) or "datetime" in str(c.get("text", "")) for c in content), (
+            f"Unexpected unified uv-time response: {res}"
+        )
+        call_timings.append(f"uv-time__get_current_time={ms:.1f}ms")
+
+    if "mcpx-logs" in active_servers:
+        res, ms = client.call_tool("mcpx-logs__list_log_sources", {})
+        assert not res.get("isError"), f"unified mcpx-logs__list_log_sources failed: {res}"
+        text = " ".join(str(c.get("text", "")) for c in res.get("content", [])).strip()
+        assert text, f"Expected non-empty unified list_log_sources output, got: {res}"
+        call_timings.append(f"mcpx-logs__list_log_sources={ms:.1f}ms")
+
+    if "context7" in active_servers:
+        resolve_tool = next(t for t in tools if t.get("name") == "context7__resolve-library-id")
+        props = resolve_tool.get("inputSchema", {}).get("properties", {})
+        c7_args: dict[str, Any] = {"libraryName": "fastapi"}
+        if "query" in props:
+            c7_args["query"] = "FastAPI routing and dependencies"
+        res, ms = client.call_tool("context7__resolve-library-id", c7_args)
+        assert not res.get("isError"), f"unified context7__resolve-library-id failed: {res}"
+        text_blob = " ".join(str(c.get("text", "")) for c in res.get("content", []))
+        assert len(text_blob.strip()) > 20, f"Expected non-empty unified Context7 response, got: {res}"
+        call_timings.append(f"context7__resolve-library-id={ms:.1f}ms")
+
+    print(
+        f"    PASS  unified /mcp initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
+        f"count={len(tool_names)} {' '.join(call_timings)}"
+    )
+    return client
+
+
+def run_ops_group_e2e(base_url: str, token: str) -> McpStreamableClient:
+    print("\n==> E2E test: group /groups/ops/mcp (allow-list isolation & negative call rejection)")
+    client = McpStreamableClient(f"{base_url}/groups/ops/mcp", token)
+    init_ms = client.initialize()
+    tools, list_ms = client.list_tools()
+    tool_names = [t.get("name", "") for t in tools]
+
+    allowed_expected = [
+        "uv-time__get_current_time",
+        "mcpx-logs__list_log_sources",
+        "mcpx-logs__get_logs",
+    ]
+    for name in allowed_expected:
+        assert name in tool_names, f"Expected '{name}' in /groups/ops/mcp tools, got {tool_names}"
+
+    disallowed_expected = [
+        "uv-time__convert_time",
+        "gemini-sound__gemini_sound_list_voices",
+        "context7__resolve-library-id",
+    ]
+    for name in disallowed_expected:
+        assert name not in tool_names, f"Disallowed tool '{name}' leaked into /groups/ops/mcp: {tool_names}"
+
+    time_res, time_ms = client.call_tool("uv-time__get_current_time", {"timezone": "UTC"})
+    assert not time_res.get("isError"), f"ops uv-time__get_current_time failed: {time_res}"
+    content = time_res.get("content", [])
+    assert content and any("UTC" in str(c.get("text", "")) or "datetime" in str(c.get("text", "")) for c in content), (
+        f"Unexpected ops uv-time response: {time_res}"
+    )
+
+    logs_res, logs_ms = client.call_tool("mcpx-logs__list_log_sources", {})
+    assert not logs_res.get("isError"), f"ops mcpx-logs__list_log_sources failed: {logs_res}"
+    logs_text = " ".join(str(c.get("text", "")) for c in logs_res.get("content", [])).strip()
+    assert logs_text, f"Expected non-empty ops list_log_sources output, got: {logs_res}"
+
+    # Negative test: disallowed tool must be cleanly rejected.
+    denied_resp, deny_ms = client.rpc(
+        "tools/call",
+        {
+            "name": "uv-time__convert_time",
+            "arguments": {"source_timezone": "UTC", "time": "12:00", "target_timezone": "America/New_York"},
+        },
+        allow_error=True,
+    )
+    is_rejected = ("error" in denied_resp) or (denied_resp.get("result", {}).get("isError") is True)
+    assert is_rejected, f"Expected disallowed tool uv-time__convert_time to be rejected on /groups/ops/mcp: {denied_resp}"
+
+    print(
+        f"    PASS  /groups/ops/mcp initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
+        f"get_current_time={time_ms:.1f}ms list_log_sources={logs_ms:.1f}ms "
+        f"disallowed_reject={deny_ms:.1f}ms tools={tool_names}"
+    )
+    return client
+
+
+def run_generic_group_e2e(base_url: str, token: str, group_name: str) -> McpStreamableClient:
+    print(f"\n==> E2E test: group /groups/{group_name}/mcp")
+    client = McpStreamableClient(f"{base_url}/groups/{group_name}/mcp", token)
+    init_ms = client.initialize()
+    tools, list_ms = client.list_tools()
+    tool_names = [t.get("name") for t in tools]
+    assert tool_names, f"Expected at least one tool from group '{group_name}', got empty list"
+    print(
+        f"    PASS  /groups/{group_name}/mcp initialize={init_ms:.1f}ms "
+        f"tools/list={list_ms:.1f}ms tools={tool_names}"
+    )
+    return client
+
+
 def run_profiling(
     base_url: str,
     token: str,
+    unified_client: Optional[McpStreamableClient],
+    unified_has_uv_time: bool,
     uv_client: Optional[McpStreamableClient],
+    ops_client: Optional[McpStreamableClient],
     c7_client: Optional[McpStreamableClient],
     logs_client: Optional[McpStreamableClient],
     iterations: int,
@@ -671,13 +883,19 @@ def run_profiling(
     print(f"\n==> Latency profiling ({iterations} warm iterations each)")
     auth_headers = {"Authorization": f"Bearer {token}"}
 
-    health_prof = ProfileSummary("GET /_healthz (HTTPS + auth)")
+    health_prof = ProfileSummary("GET /_healthz (auth)")
     summaries: list[ProfileSummary] = [health_prof]
 
+    unified_prof = (
+        ProfileSummary("POST /mcp tools/call (unified)" if unified_has_uv_time else "POST /mcp tools/list (unified)")
+        if unified_client
+        else None
+    )
     uv_prof = ProfileSummary("POST /uv-time/mcp tools/call (uvx stdio)") if uv_client else None
+    ops_prof = ProfileSummary("POST /groups/ops/mcp tools/call (group)") if ops_client else None
     c7_prof = ProfileSummary("POST /context7/mcp tools/list (remote proxy)") if c7_client else None
     logs_prof = ProfileSummary("POST /mcpx-logs/mcp tools/call (list_log_sources)") if logs_client else None
-    for prof in (uv_prof, c7_prof, logs_prof):
+    for prof in (unified_prof, uv_prof, ops_prof, c7_prof, logs_prof):
         if prof is not None:
             summaries.append(prof)
 
@@ -686,9 +904,20 @@ def run_profiling(
         assert r.status == 200
         health_prof.samples_ms.append(r.elapsed_ms)
 
+        if unified_client and unified_prof:
+            if unified_has_uv_time:
+                _, uni_ms = unified_client.call_tool("uv-time__get_current_time", {"timezone": "UTC"})
+            else:
+                _, uni_ms = unified_client.list_tools()
+            unified_prof.samples_ms.append(uni_ms)
+
         if uv_client and uv_prof:
             _, uv_ms = uv_client.call_tool("get_current_time", {"timezone": "UTC"})
             uv_prof.samples_ms.append(uv_ms)
+
+        if ops_client and ops_prof:
+            _, ops_ms = ops_client.call_tool("uv-time__get_current_time", {"timezone": "UTC"})
+            ops_prof.samples_ms.append(ops_ms)
 
         if c7_client and c7_prof:
             _, c7_ms = c7_client.list_tools()
@@ -709,14 +938,16 @@ def run_profiling(
     assert health_prof.p95_ms <= max_p95_health_ms, (
         f"Healthcheck p95 latency {health_prof.p95_ms:.1f}ms exceeded budget {max_p95_health_ms:.1f}ms"
     )
-    if uv_prof is not None:
-        assert uv_prof.p95_ms <= max_p95_uv_ms, (
-            f"uv-time tool call p95 latency {uv_prof.p95_ms:.1f}ms exceeded budget {max_p95_uv_ms:.1f}ms"
-        )
-    budget_note = f"health p95 {health_prof.p95_ms:.1f}ms <= {max_p95_health_ms:.0f}ms"
-    if uv_prof is not None:
-        budget_note += f", uv-time p95 {uv_prof.p95_ms:.1f}ms <= {max_p95_uv_ms:.0f}ms"
-    print(f"\n    PASS  Latency budgets satisfied ({budget_note})")
+    budget_parts = [f"health p95 {health_prof.p95_ms:.1f}ms <= {max_p95_health_ms:.0f}ms"]
+
+    for label, prof in (("unified", unified_prof), ("uv-time", uv_prof), ("ops-group", ops_prof)):
+        if prof is not None:
+            assert prof.p95_ms <= max_p95_uv_ms, (
+                f"{label} p95 latency {prof.p95_ms:.1f}ms exceeded budget {max_p95_uv_ms:.1f}ms"
+            )
+            budget_parts.append(f"{label} p95 {prof.p95_ms:.1f}ms <= {max_p95_uv_ms:.0f}ms")
+
+    print(f"\n    PASS  Latency budgets satisfied ({', '.join(budget_parts)})")
     return summaries
 
 
@@ -725,7 +956,7 @@ def _parse_csv(raw: str) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="E2E & profiling suite for live MCPX gateway")
+    parser = argparse.ArgumentParser(description="E2E & profiling suite for live mcpx-gateway")
     default_host = (os.environ.get("MCP_SUBDOMAIN") or "").strip() or (os.environ.get("DOMAIN") or "").strip()
     if default_host and not default_host.lower().startswith(("http://", "https://")):
         default_base_url = f"https://{default_host}"
@@ -757,13 +988,28 @@ def main() -> int:
         help="Comma-separated servers to skip (e.g. gemini-sound,context7)",
     )
     parser.add_argument(
+        "--groups",
+        default="",
+        help="Comma-separated groups to test (default: auto-detected via scripts/mcp-servers.sh list-groups; 'none' to disable)",
+    )
+    parser.add_argument(
+        "--skip-groups",
+        default="",
+        help="Comma-separated groups to skip (e.g. ops)",
+    )
+    parser.add_argument(
+        "--skip-oauth",
+        action="store_true",
+        help="Skip OAuth 2.1 checks and /_healthz 401 check (for direct testing against local http://127.0.0.1:9000)",
+    )
+    parser.add_argument(
         "--call-gemini-sound",
         action="store_true",
         help="Invoke gemini_generate_sound and verify valid WAV AudioContent (uses Gemini API)",
     )
     parser.add_argument("--iterations", type=int, default=5, help="Warm profiling iterations per operation")
     parser.add_argument("--max-p95-health-ms", type=float, default=1500.0, help="p95 budget for /_healthz (ms)")
-    parser.add_argument("--max-p95-uv-ms", type=float, default=2000.0, help="p95 budget for uv-time tools/call (ms)")
+    parser.add_argument("--max-p95-uv-ms", type=float, default=2000.0, help="p95 budget for MCP tool calls (ms)")
     parser.add_argument("--json-out", default="", help="Optional path to write JSON profiling report")
     args = parser.parse_args()
 
@@ -775,14 +1021,37 @@ def main() -> int:
         parser.error("Provide --base-url (or MCP_SUBDOMAIN / DOMAIN) and --token (or MCP_BEARER_TOKEN).")
 
     servers = _parse_csv(args.servers) if args.servers else discover_enabled_servers()
-    skip = set(_parse_csv(args.skip_servers))
-    active_servers = [s for s in servers if s not in skip]
+    skip_servers = set(_parse_csv(args.skip_servers))
+    active_servers = [s for s in servers if s not in skip_servers]
     if not active_servers:
         parser.error("No servers selected to test after applying --skip-servers.")
 
+    if args.groups.strip().lower() == "none":
+        groups: list[str] = []
+    elif args.groups:
+        groups = _parse_csv(args.groups)
+    else:
+        groups = discover_enabled_groups()
+    skip_groups = set(_parse_csv(args.skip_groups))
+    active_groups = [g for g in groups if g not in skip_groups]
+
     probe_server = "uv-time" if "uv-time" in active_servers else active_servers[0]
-    run_security_and_health_checks(base_url, args.token, probe_server=probe_server)
-    run_oauth_e2e(base_url, consent_password=(args.oauth_password or args.token), probe_server=probe_server)
+    probe_group = "ops" if "ops" in active_groups else (active_groups[0] if active_groups else None)
+
+    run_security_and_health_checks(
+        base_url,
+        args.token,
+        probe_server=probe_server,
+        probe_group=probe_group,
+        skip_oauth=args.skip_oauth,
+    )
+    if not args.skip_oauth:
+        run_oauth_e2e(
+            base_url,
+            consent_password=(args.oauth_password or args.token),
+            probe_server=probe_server,
+            probe_group=probe_group,
+        )
 
     uv_client: Optional[McpStreamableClient] = None
     c7_client: Optional[McpStreamableClient] = None
@@ -800,10 +1069,22 @@ def main() -> int:
         else:
             run_generic_server_e2e(base_url, args.token, server)
 
+    unified_client = run_unified_e2e(base_url, args.token, active_servers=active_servers)
+
+    ops_client: Optional[McpStreamableClient] = None
+    for group in active_groups:
+        if group == "ops":
+            ops_client = run_ops_group_e2e(base_url, args.token)
+        else:
+            run_generic_group_e2e(base_url, args.token, group)
+
     summaries = run_profiling(
         base_url,
         args.token,
+        unified_client=unified_client,
+        unified_has_uv_time=("uv-time" in active_servers),
         uv_client=uv_client,
+        ops_client=ops_client,
         c7_client=c7_client,
         logs_client=logs_client,
         iterations=args.iterations,
@@ -815,6 +1096,7 @@ def main() -> int:
         report = {
             "baseUrl": base_url,
             "servers": active_servers,
+            "groups": active_groups,
             "iterations": args.iterations,
             "profiles": [
                 {
