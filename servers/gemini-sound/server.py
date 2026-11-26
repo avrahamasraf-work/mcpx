@@ -7,7 +7,7 @@
 # ///
 """MCPX stdio MCP server for generating speech/audio via the Google Gemini API.
 
-Launched by mcp-proxy via `uv run --script /servers/gemini-sound/server.py` and
+Launched by mcpx-gateway via `uv run --script /servers/gemini-sound/server.py` and
 exposed behind Caddy HTTPS + Bearer auth at `/gemini-sound/mcp`. Uses
 GEMINI_API_KEY (or GEMINI_TOKEN) from the gateway environment and logs to
 `<MCPX_LOG_DIR>/servers/gemini-sound.log` plus stderr.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Deploys the MCPX gateway stack (Caddy + tbxark/mcp-proxy) to the GCP VM over SSH.
+# Deploys the MCPX gateway stack (Caddy + mcpx-oauth + mcpx-gateway) to the GCP VM over SSH.
 # Bootstraps swap/Docker, builds the merged config via scripts/mcp-servers.sh when
 # CONFIG_FILE is unset, syncs secrets from MCPS_ENV_FILE into ~/mcp-server/.env,
-# starts Docker Compose, and runs live HTTPS and E2E verification.
+# uploads gateway/oauth/servers, builds and starts Docker Compose, and runs E2E checks.
 
 set -euo pipefail
 
@@ -115,8 +115,8 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER" || true
 
 mkdir -p "$HOME/mcp-server"
-rm -rf "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new"
-mkdir -p "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new"
+rm -rf "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new" "$HOME/mcp-server/gateway.new"
+mkdir -p "$HOME/mcp-server/servers.new" "$HOME/mcp-server/oauth.new" "$HOME/mcp-server/gateway.new"
 REMOTE_BOOTSTRAP
 
 echo "==> Preparing temporary .env and effective config locally (chmod 600)..."
@@ -217,24 +217,53 @@ if [ -d "${REPO_ROOT}/infra/oauth" ]; then
   fi
 fi
 
-echo "==> Locking permissions, syncing servers/ and oauth/, validating config, and starting Docker Compose stack..."
+if [ ! -d "${REPO_ROOT}/infra/gateway" ]; then
+  echo "ERROR: Gateway directory not found: ${REPO_ROOT}/infra/gateway" >&2
+  exit 1
+fi
+GATEWAY_ENTRIES=()
+for entry in "${REPO_ROOT}/infra/gateway"/*; do
+  [ -e "${entry}" ] || continue
+  base_name="$(basename "${entry}")"
+  if [ "${base_name}" = "__pycache__" ] || [[ "${base_name}" == *.pyc ]]; then
+    continue
+  fi
+  GATEWAY_ENTRIES+=("${entry}")
+done
+if [ "${#GATEWAY_ENTRIES[@]}" -eq 0 ]; then
+  echo "ERROR: Gateway directory is empty: ${REPO_ROOT}/infra/gateway" >&2
+  exit 1
+fi
+scp_vm \
+  --recurse \
+  "${GATEWAY_ENTRIES[@]}" \
+  "${VM_NAME}:~/mcp-server/gateway.new/"
+
+echo "==> Locking permissions, syncing gateway/, servers/, and oauth/, building mcpx-gateway, and starting Docker Compose stack..."
 ssh_vm 'bash -s' <<'REMOTE_START'
 set -euo pipefail
 cd "$HOME/mcp-server"
 chmod 600 .env
 chmod 644 docker-compose.yml Caddyfile config.json
 
-rm -rf "$HOME/mcp-server/servers" "$HOME/mcp-server/oauth"
+find "$HOME/mcp-server/gateway.new" \( -type d -name '__pycache__' -o -type f -name '*.pyc' \) -exec rm -rf {} +
+
+rm -rf "$HOME/mcp-server/servers" "$HOME/mcp-server/oauth" "$HOME/mcp-server/gateway"
 mv "$HOME/mcp-server/servers.new" "$HOME/mcp-server/servers"
 mv "$HOME/mcp-server/oauth.new" "$HOME/mcp-server/oauth"
+mv "$HOME/mcp-server/gateway.new" "$HOME/mcp-server/gateway"
 
-sudo docker compose pull </dev/null
-sudo docker compose run -T --rm --no-deps mcp-proxy --config /config/config.json -check-config </dev/null
-sudo docker compose up -d --force-recreate --remove-orphans </dev/null
+sudo docker compose pull caddy mcpx-oauth </dev/null
+sudo docker compose build mcpx-gateway </dev/null
+sudo docker compose run -T --rm --no-deps mcpx-gateway --config /config/config.json --check-config </dev/null
+sudo docker compose up -d --remove-orphans </dev/null
+sudo docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile </dev/null
 
-echo "==> Verifying uv and uvx inside mcp-proxy container:"
-sudo docker compose exec -T mcp-proxy uv --version </dev/null
-sudo docker compose exec -T mcp-proxy uvx --version </dev/null
+echo "==> Verifying uv, uvx, node, and npx inside mcpx-gateway container:"
+sudo docker compose exec -T mcpx-gateway uv --version </dev/null
+sudo docker compose exec -T mcpx-gateway uvx --version </dev/null
+sudo docker compose exec -T mcpx-gateway node --version </dev/null
+sudo docker compose exec -T mcpx-gateway npx --version </dev/null
 
 echo "==> Container status:"
 sudo docker compose ps </dev/null

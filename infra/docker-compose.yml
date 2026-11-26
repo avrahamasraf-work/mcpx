@@ -1,7 +1,7 @@
 # Docker Compose stack for the MCPX remote MCP gateway.
-# Runs the internal mcp-proxy gateway alongside the public Caddy HTTPS reverse proxy.
-# Shares the persistent mcpx-logs volume (/var/log/mcpx) across both services
-# so Caddy, mcp-proxy, and local MCP servers write logs to one place.
+# Runs the internal mcpx-gateway and mcpx-oauth services alongside Caddy HTTPS.
+# Shares the persistent mcpx-logs volume (/var/log/mcpx) across all services
+# so Caddy, mcpx-oauth, mcpx-gateway, and local MCP servers write logs together.
 x-logging: &default-logging
   driver: json-file
   options:
@@ -9,11 +9,10 @@ x-logging: &default-logging
     max-file: "3"
 
 services:
-  mcp-proxy:
-    # Pinned to v0.58.0: v1.1.0's 5s discoverProbeTimeout triggers an infinite
-    # 2025-11-25 vs 2026-07-28 protocol-mismatch retry loop on slow e2-micro stdio starts.
-    image: ghcr.io/tbxark/mcp-proxy:v0.58.0
-    container_name: mcp-proxy
+  mcpx-gateway:
+    build: ./gateway
+    image: mcpx-gateway:local
+    container_name: mcpx-gateway
     restart: unless-stopped
     mem_limit: 768m
     security_opt:
@@ -23,17 +22,6 @@ services:
       - .env
     environment:
       MCPX_LOG_DIR: /var/log/mcpx
-    entrypoint:
-      - /usr/bin/bash
-      - -c
-      - |
-        set -o pipefail
-        mkdir -p /var/log/mcpx/servers
-        if [ -f /var/log/mcpx/mcp-proxy.log ] && [ "$(wc -c < /var/log/mcpx/mcp-proxy.log)" -gt 10485760 ]; then
-          mv /var/log/mcpx/mcp-proxy.log /var/log/mcpx/mcp-proxy.log.1
-        fi
-        /main "$@" 2>&1 | tee -a /var/log/mcpx/mcp-proxy.log
-      - --
     command:
       - --config
       - /config/config.json
@@ -54,9 +42,9 @@ services:
           "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/_healthz', timeout=3)",
         ]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 20s
+      start_period: 60s
     networks:
       - mcp-net
 
@@ -117,7 +105,7 @@ services:
       - caddy-config:/config
       - mcpx-logs:/var/log/mcpx
     depends_on:
-      mcp-proxy:
+      mcpx-gateway:
         condition: service_healthy
       mcpx-oauth:
         condition: service_healthy

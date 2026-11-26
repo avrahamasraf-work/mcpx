@@ -1,0 +1,13 @@
+{
+  "groups": {
+    "ops": {
+      "description": "Operations tools (current time and gateway/server logs)",
+      "servers": {
+        "uv-time": [
+          "get_current_time"
+        ],
+        "mcpx-logs": "*"
+      }
+    }
+  }
+}

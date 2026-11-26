@@ -1,9 +1,9 @@
 {
-  "mcpServers": {
+  "servers": {
     "context7": {
       "url": "https://mcp.context7.com/mcp",
       "transportType": "streamable-http",
-      "timeout": "60s"
+      "timeout": 60
     }
   }
 }

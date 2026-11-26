@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Client-side observability entrypoint for the deployed MCPX HTTPS gateway.
-# Fits into MCPX alongside `scripts/mcp-servers.sh` (enabled server list) and
-# `scripts/e2e-test.py` (automated E2E verification) to let operators inspect live
-# tools via `--list` or launch Anthropic's interactive MCP Inspector web UI.
+# Client-side observability entrypoint for the deployed mcpx-gateway HTTPS stack.
+# Fits into MCPX alongside `scripts/mcp-servers.sh` (enabled servers and groups) and
+# `scripts/e2e-test.py` (automated E2E verification) to inspect `/mcp`, `/<server>/mcp`,
+# and `/groups/<group>/mcp` via `--list` or Anthropic's MCP Inspector web UI.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,14 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/inspect.sh [--list [server ...]]
-  scripts/inspect.sh [server]
+  scripts/inspect.sh [--list [target ...]]
+  scripts/inspect.sh [target]
 
 Modes:
-  --list [server ...]   Query each enabled MCPX server over Streamable HTTP and
-                        print its tools and descriptions (uses stdlib python3).
-  [server]              Launch Anthropic's MCP Inspector web UI preconfigured
-                        with all enabled MCPX servers and Bearer auth (default).
+  --list [target ...]   Query the unified `/mcp` endpoint, each enabled server
+                        `/<server>/mcp`, and each enabled group `/groups/<group>/mcp`
+                        over Streamable HTTP and print tools/descriptions.
+  [target]              Launch Anthropic's MCP Inspector web UI preconfigured
+                        with `unified`, all enabled servers, and all enabled groups
+                        (`group-<name>`) with Bearer auth (default target: unified).
 
 Environment:
   MCP_SUBDOMAIN / DOMAIN   Gateway hostname (e.g. mcpx.duckdns.org)
@@ -72,22 +74,87 @@ load_enabled_servers() {
   fi
 }
 
+load_enabled_groups() {
+  local helper="${SCRIPT_DIR}/mcp-servers.sh"
+  if [ -f "${helper}" ]; then
+    bash "${helper}" list-groups
+  else
+    printf '%s\n' ops
+  fi
+}
+
 mapfile -t ENABLED_SERVERS < <(load_enabled_servers | sed '/^[[:space:]]*$/d')
 if [ "${#ENABLED_SERVERS[@]}" -eq 0 ]; then
   echo "ERROR: No enabled servers found." >&2
   exit 1
 fi
+mapfile -t ENABLED_GROUPS < <(load_enabled_groups | sed '/^[[:space:]]*$/d')
+
+is_in_list() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [ "${item}" = "${needle}" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_target_spec() {
+  local target="$1"
+  case "${target}" in
+    unified|/mcp)
+      printf '%s\n' "unified=/mcp"
+      return
+      ;;
+    group-*)
+      local grp="${target#group-}"
+      printf '%s\n' "group-${grp}=/groups/${grp}/mcp"
+      return
+      ;;
+    /groups/*|groups/*)
+      local grp="${target#/}"
+      grp="${grp#groups/}"
+      grp="${grp%/mcp}"
+      printf '%s\n' "group-${grp}=/groups/${grp}/mcp"
+      return
+      ;;
+  esac
+  if [ "${#ENABLED_GROUPS[@]}" -gt 0 ] && is_in_list "${target}" "${ENABLED_GROUPS[@]}" && ! is_in_list "${target}" "${ENABLED_SERVERS[@]}"; then
+    printf '%s\n' "group-${target}=/groups/${target}/mcp"
+    return
+  fi
+  printf '%s\n' "${target}=/${target}/mcp"
+}
+
+build_all_target_specs() {
+  local srv grp
+  printf '%s\n' "unified=/mcp"
+  for srv in "${ENABLED_SERVERS[@]}"; do
+    printf '%s\n' "${srv}=/${srv}/mcp"
+  done
+  if [ "${#ENABLED_GROUPS[@]}" -gt 0 ]; then
+    for grp in "${ENABLED_GROUPS[@]}"; do
+      printf '%s\n' "group-${grp}=/groups/${grp}/mcp"
+    done
+  fi
+}
 
 if [ "${1:-}" = "--list" ]; then
   shift
+  TARGET_SPECS=()
   if [ "$#" -gt 0 ]; then
-    TARGET_SERVERS=("$@")
+    for arg in "$@"; do
+      TARGET_SPECS+=("$(resolve_target_spec "${arg}")")
+    done
   else
-    TARGET_SERVERS=("${ENABLED_SERVERS[@]}")
+    mapfile -t TARGET_SPECS < <(build_all_target_specs)
   fi
 
   BASE_URL="${BASE_URL}" MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN}" \
-    python3 - "${TARGET_SERVERS[@]}" <<'PY'
+    python3 - "${TARGET_SPECS[@]}" <<'PY'
 import json
 import os
 import sys
@@ -96,7 +163,7 @@ import urllib.request
 
 base_url = os.environ["BASE_URL"].rstrip("/")
 token = os.environ["MCP_BEARER_TOKEN"]
-servers = sys.argv[1:]
+specs = sys.argv[1:]
 
 
 def parse_mcp_body(raw: str) -> dict:
@@ -140,9 +207,10 @@ def post_rpc(url: str, payload: dict, session_id: str | None) -> tuple[dict, str
 
 
 failed = False
-for server in servers:
-    url = f"{base_url}/{server}/mcp"
-    print(f"=== {server} ({url}) ===")
+for spec in specs:
+    label, path = spec.split("=", 1)
+    url = f"{base_url}{path}"
+    print(f"=== {label} ({url}) ===")
     try:
         _, sid = post_rpc(
             url,
@@ -193,18 +261,19 @@ if ! command -v npx >/dev/null 2>&1; then
   exit 1
 fi
 
-SELECTED_SERVER="${1:-${ENABLED_SERVERS[0]}}"
-CONFIG_SERVERS=("${ENABLED_SERVERS[@]}")
-FOUND=0
-for srv in "${CONFIG_SERVERS[@]}"; do
-  if [ "${srv}" = "${SELECTED_SERVER}" ]; then
-    FOUND=1
-    break
-  fi
-done
-if [ "${FOUND}" -eq 0 ]; then
-  CONFIG_SERVERS+=("${SELECTED_SERVER}")
+mapfile -t CONFIG_SPECS < <(build_all_target_specs)
+SELECTED_SPEC="$(resolve_target_spec "${1:-unified}")"
+SELECTED_NAME="${SELECTED_SPEC%%=*}"
+SELECTED_PATH="${SELECTED_SPEC#*=}"
+
+if ! is_in_list "${SELECTED_SPEC}" "${CONFIG_SPECS[@]}"; then
+  CONFIG_SPECS+=("${SELECTED_SPEC}")
 fi
+
+CONFIG_NAMES=()
+for spec in "${CONFIG_SPECS[@]}"; do
+  CONFIG_NAMES+=("${spec%%=*}")
+done
 
 TMP_CFG="$(mktemp /tmp/mcpx-inspector-config.XXXXXX.json)"
 cleanup() {
@@ -216,7 +285,7 @@ trap 'exit 143' TERM
 chmod 600 "${TMP_CFG}"
 
 BASE_URL="${BASE_URL}" MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN}" TMP_CFG="${TMP_CFG}" \
-  python3 - "${CONFIG_SERVERS[@]}" <<'PY'
+  python3 - "${CONFIG_SPECS[@]}" <<'PY'
 import json
 import os
 import sys
@@ -224,25 +293,25 @@ import sys
 base_url = os.environ["BASE_URL"].rstrip("/")
 token = os.environ["MCP_BEARER_TOKEN"]
 out_path = os.environ["TMP_CFG"]
-servers = sys.argv[1:]
+specs = sys.argv[1:]
 
-config = {
-    "mcpServers": {
-        name: {
-            "type": "streamable-http",
-            "url": f"{base_url}/{name}/mcp",
-            "headers": {
-                "Authorization": f"Bearer {token}",
-            },
-        }
-        for name in servers
+mcp_servers = {}
+for spec in specs:
+    name, path = spec.split("=", 1)
+    mcp_servers[name] = {
+        "type": "streamable-http",
+        "url": f"{base_url}{path}",
+        "headers": {
+            "Authorization": f"Bearer {token}",
+        },
     }
-}
+
+config = {"mcpServers": mcp_servers}
 
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(config, fh, indent=2)
 PY
 
-echo "==> Launching MCP Inspector UI for '${SELECTED_SERVER}' (${BASE_URL}/${SELECTED_SERVER}/mcp)"
-echo "    Configured servers: ${CONFIG_SERVERS[*]}"
-npx --yes @modelcontextprotocol/inspector --web --config "${TMP_CFG}" --server "${SELECTED_SERVER}"
+echo "==> Launching MCP Inspector UI for '${SELECTED_NAME}' (${BASE_URL}${SELECTED_PATH})"
+echo "    Configured endpoints: ${CONFIG_NAMES[*]}"
+npx --yes @modelcontextprotocol/inspector --web --config "${TMP_CFG}" --server "${SELECTED_NAME}"
