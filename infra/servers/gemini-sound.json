@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "gemini-sound": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--script",
+        "/servers/gemini-sound/server.py"
+      ],
+      "env": {
+        "GEMINI_API_KEY": "${GEMINI_API_KEY}",
+        "GEMINI_TOKEN": "${GEMINI_TOKEN}",
+        "GEMINI_SOUND_MODEL": "${GEMINI_SOUND_MODEL}",
+        "GEMINI_USE_VERTEXAI": "${GEMINI_USE_VERTEXAI}",
+        "MCPX_LOG_DIR": "/var/log/mcpx"
+      },
+      "timeout": "120s"
+    }
+  }
+}

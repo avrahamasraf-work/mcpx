@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "skills": {
+    "audit-agent-context": {
+      "source": "avreymi-asraf/agent-skills",
+      "commit": "9fee9494fb75d1168ba507a8dbb3dd9050c45433",
+      "sourceType": "github",
+      "skillPath": "skills/audit-agent-context/SKILL.md",
+      "computedHash": "0bdab01df24ef088954f92c6e1c3f123c3b122b404ef8a47dae203baf7f9607f"
+    },
+    "coding-principles": {
+      "source": "avreymi-asraf/agent-skills",
+      "commit": "9fee9494fb75d1168ba507a8dbb3dd9050c45433",
+      "sourceType": "github",
+      "skillPath": "skills/coding-principles/SKILL.md",
+      "computedHash": "65bff34cba6d79130208182cdc19965fb47fa7b074c68c99fe937826fe33c82d"
+    },
+    "grow-autonomy": {
+      "source": "avreymi-asraf/agent-skills",
+      "commit": "9fee9494fb75d1168ba507a8dbb3dd9050c45433",
+      "sourceType": "github",
+      "skillPath": "skills/grow-autonomy/SKILL.md",
+      "computedHash": "5d7463dfe6c323bf0db8b16c3805ab7170f36fb1058f87744165d3b756137af8"
+    },
+    "testing": {
+      "source": "avreymi-asraf/agent-skills",
+      "commit": "9fee9494fb75d1168ba507a8dbb3dd9050c45433",
+      "sourceType": "github",
+      "skillPath": "skills/testing/SKILL.md",
+      "computedHash": "1c92b3f81a7e9b189a3baa8399e1cc9c86b49473f437dbbbac41a5a1cdde4e10"
+    }
+  }
+}

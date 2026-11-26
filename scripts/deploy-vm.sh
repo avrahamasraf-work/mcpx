@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Deploys the MCPX gateway stack (Caddy + tbxark/mcp-proxy) to the GCP VM over SSH.
+# Bootstraps swap/Docker, builds the merged config via scripts/mcp-servers.sh when
+# CONFIG_FILE is unset, syncs secrets from MCPS_ENV_FILE into ~/mcp-server/.env,
+# starts Docker Compose, and runs live HTTPS and E2E verification.
 
-# Provision the VM over SSH and deploy the Caddy + tbxark/mcp-proxy stack:
-#   1. Verify DNS A record resolves to the VM's static external IP
-#   2. Create and enable a 2 GB /swapfile persisted in /etc/fstab
-#   3. Install Docker and Docker Compose plugin
-#   4. Upload infra files (docker-compose.yml, Caddyfile, config.json) + servers/ + secure .env
-#   5. Validate mcp-proxy config, start containers, verify uv works inside mcp-proxy,
-#      and test HTTPS auth (401 without token, 200 with Bearer token)
+set -euo pipefail
 
 export PATH="$HOME/google-cloud-sdk/bin:$PATH"
 export CLOUDSDK_CORE_DISABLE_PROMPTS=1
@@ -21,18 +18,31 @@ GCP_ZONE="${GCP_ZONE:-${GCP_REGION}-b}"
 VM_NAME="${VM_NAME:-mcpx-gateway}"
 MCP_SUBDOMAIN="${MCP_SUBDOMAIN:-${DOMAIN:-}}"
 : "${MCP_SUBDOMAIN:?Set MCP_SUBDOMAIN or DOMAIN (e.g. mcpx.duckdns.org)}"
-MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN}"
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/infra/config.json}"
-ENABLE_GEMINI="${ENABLE_GEMINI:-0}"
-GEMINI_OVERLAY_FILE="${REPO_ROOT}/infra/config.gemini-overlay.json"
+MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:-}"
+CONFIG_FILE="${CONFIG_FILE:-}"
+MCPS_ENV_FILE="${MCPS_ENV_FILE:-}"
 SKIP_DNS_CHECK="${SKIP_DNS_CHECK:-0}"
 USE_IAP_SSH="${USE_IAP_SSH:-0}"
 
-if [ ! -f "${CONFIG_FILE}" ]; then
-  echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
-  exit 1
+if [ -n "${CONFIG_FILE}" ]; then
+  if [ ! -f "${CONFIG_FILE}" ]; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+  jq empty "${CONFIG_FILE}"
 fi
-jq empty "${CONFIG_FILE}"
+
+if [ -n "${MCPS_ENV_FILE}" ]; then
+  if [ ! -f "${MCPS_ENV_FILE}" ]; then
+    echo "ERROR: MCPS_ENV_FILE not found: ${MCPS_ENV_FILE}" >&2
+    exit 1
+  fi
+  if [ -z "${MCP_BEARER_TOKEN}" ]; then
+    MCP_BEARER_TOKEN="$(grep -E '^(export[[:space:]]+)?MCP_BEARER_TOKEN=' "${MCPS_ENV_FILE}" | tail -n 1 | sed -E 's/^(export[[:space:]]+)?MCP_BEARER_TOKEN=//; s/\r$//; s/^["'\'']//; s/["'\'']$//' || true)"
+  fi
+fi
+
+: "${MCP_BEARER_TOKEN:?Set MCP_BEARER_TOKEN (or provide it inside MCPS_ENV_FILE)}"
 
 SSH_IAP_ARGS=()
 if [ "${USE_IAP_SSH}" = "1" ]; then
@@ -110,7 +120,6 @@ mkdir -p "$HOME/mcp-server/servers.new"
 REMOTE_BOOTSTRAP
 
 echo "==> Preparing temporary .env and effective config locally (chmod 600)..."
-GEMINI_API_KEY="${GEMINI_API_KEY:-${GEMINI_TOKEN:-}}"
 TMP_ENV="$(mktemp /tmp/mcpx-deploy-env.XXXXXX)"
 TMP_CONFIG=""
 cleanup_tmp() {
@@ -120,29 +129,46 @@ trap cleanup_tmp EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 chmod 600 "${TMP_ENV}"
+
 {
   printf 'MCP_SUBDOMAIN=%s\n' "${MCP_SUBDOMAIN}"
-  printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
-  if [ -n "${GEMINI_API_KEY:-}" ]; then
-    printf 'GEMINI_API_KEY=%s\n' "${GEMINI_API_KEY}"
-  fi
-  if [ -n "${GEMINI_DEFAULT_MODEL:-}" ]; then
-    printf 'GEMINI_DEFAULT_MODEL=%s\n' "${GEMINI_DEFAULT_MODEL}"
-  fi
-  if [ -n "${GEMINI_USE_VERTEXAI:-}" ]; then
-    printf 'GEMINI_USE_VERTEXAI=%s\n' "${GEMINI_USE_VERTEXAI}"
+  if [ -n "${MCPS_ENV_FILE}" ]; then
+    has_bearer_token=0
+    while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+      line="${raw_line%$'\r'}"
+      case "${line}" in
+        ""|\#*) continue ;;
+      esac
+      if [[ "${line}" =~ ^[[:space:]]*# ]] || [[ "${line}" =~ ^[[:space:]]*$ ]]; then
+        continue
+      fi
+      line="${line#export }"
+      if [[ "${line}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        key="${line%%=*}"
+        if [ "${key}" = "MCP_SUBDOMAIN" ]; then
+          continue
+        fi
+        if [ "${key}" = "MCP_BEARER_TOKEN" ]; then
+          has_bearer_token=1
+        fi
+        printf '%s\n' "${line}"
+      fi
+    done < "${MCPS_ENV_FILE}"
+    if [ "${has_bearer_token}" -eq 0 ]; then
+      printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
+    fi
+  else
+    echo "WARNING: MCPS_ENV_FILE is not set; only MCP_SUBDOMAIN and MCP_BEARER_TOKEN will be written to .env." >&2
+    printf 'MCP_BEARER_TOKEN=%s\n' "${MCP_BEARER_TOKEN}"
   fi
 } > "${TMP_ENV}"
 
-EFFECTIVE_CONFIG_FILE="${CONFIG_FILE}"
-if [ "${ENABLE_GEMINI}" = "1" ]; then
-  if [ ! -f "${GEMINI_OVERLAY_FILE}" ]; then
-    echo "ERROR: Gemini overlay config not found: ${GEMINI_OVERLAY_FILE}" >&2
-    exit 1
-  fi
+if [ -n "${CONFIG_FILE}" ]; then
+  EFFECTIVE_CONFIG_FILE="${CONFIG_FILE}"
+else
   TMP_CONFIG="$(mktemp /tmp/mcpx-deploy-config.XXXXXX.json)"
   chmod 600 "${TMP_CONFIG}"
-  jq -s '.[0] * .[1]' "${CONFIG_FILE}" "${GEMINI_OVERLAY_FILE}" > "${TMP_CONFIG}"
+  bash "${SCRIPT_DIR}/mcp-servers.sh" build-config "${TMP_CONFIG}"
   EFFECTIVE_CONFIG_FILE="${TMP_CONFIG}"
 fi
 
@@ -236,9 +262,6 @@ echo ""
 
 echo "==> Running full E2E integration tests & latency profiling..."
 E2E_CMD=(python3 "${SCRIPT_DIR}/e2e-test.py" --iterations "${E2E_ITERATIONS:-5}")
-if jq -e '.mcpServers.gemini' "${EFFECTIVE_CONFIG_FILE}" >/dev/null 2>&1; then
-  E2E_CMD+=(--include-gemini)
-fi
 if [ -n "${E2E_EXTRA_ARGS:-}" ]; then
   read -r -a EXTRA_ARR <<< "${E2E_EXTRA_ARGS}"
   if [ "${#EXTRA_ARR[@]}" -gt 0 ]; then

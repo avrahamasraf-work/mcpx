@@ -5,7 +5,7 @@
     "name": "MCPX Gateway",
     "version": "1.0.0",
     "type": "streamable-http",
-    "startupGracePeriod": "45s",
+    "startupGracePeriod": "90s",
     "options": {
       "panicIfInvalid": false,
       "logEnabled": true,
@@ -15,18 +15,5 @@
       ]
     }
   },
-  "mcpServers": {
-    "context7": {
-      "url": "https://mcp.context7.com/mcp",
-      "transportType": "streamable-http",
-      "timeout": "60s"
-    },
-    "uv-time": {
-      "command": "uvx",
-      "args": [
-        "mcp-server-time==2026.11.18"
-      ],
-      "timeout": "60s"
-    }
-  }
+  "mcpServers": {}
 }

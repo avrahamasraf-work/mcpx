@@ -1,4 +1,16 @@
+# Caddy reverse proxy configuration for the MCPX HTTPS gateway.
+# Terminates Let's Encrypt TLS, enforces Bearer token auth, and streams
+# MCP traffic to the internal mcp-proxy service on port 9000.
+# Writes rotating JSON access logs to /var/log/mcpx/caddy.log.
 {$MCP_SUBDOMAIN} {
+	log {
+		output file /var/log/mcpx/caddy.log {
+			roll_size 10mb
+			roll_keep 3
+		}
+		format json
+	}
+
 	@unauthorized {
 		not header Authorization "Bearer {$MCP_BEARER_TOKEN}"
 	}

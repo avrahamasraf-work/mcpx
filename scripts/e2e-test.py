@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
-"""End-to-end integration tests and latency profiling for the live MCPX HTTPS gateway.
+"""Live end-to-end integration tests and latency profiler for the MCPX HTTPS gateway.
 
-Runs real HTTP/TLS and MCP Streamable HTTP JSON-RPC calls against the deployed gateway:
-  1. Auth & security checks (401 without/invalid Bearer token, 200 with valid token)
-  2. Gateway health & readiness checks (/_healthz, /_readyz)
-  3. Live MCP E2E handshake + tools/list + tools/call for `uv-time` (proves uv/uvx works)
-  4. Live MCP E2E handshake + tools/list + tools/call for `context7`
-  5. Optional live MCP E2E test for `gemini` (--include-gemini)
-  6. Multi-iteration latency profiling (min / p50 / avg / p95 / max in ms)
-
-Zero unit tests, zero mocks — strictly live E2E & integration verification.
+Fits into MCPX as the automated verification step run after `scripts/deploy-vm.sh` or
+`scripts/mcp-servers.sh deploy`, and standalone by operators to validate the live gateway.
+Exercises real HTTPS/TLS auth, `/_healthz` & `/_readyz`, every enabled MCP server
+(`uv-time`, `context7`, `mcpx-logs`, `gemini-sound`), and multi-iteration p95 latency budgets.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import http.client
 import json
 import math
 import os
 import ssl
 import statistics
+import subprocess
 import sys
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -270,41 +268,73 @@ class McpStreamableClient:
         return resp.get("result", {}), ms
 
 
-def run_security_and_health_checks(base_url: str, token: str) -> None:
-    print("==> [1/4] Security & Auth integration tests")
+DEFAULT_SERVERS = ["context7", "uv-time", "gemini-sound", "mcpx-logs"]
+
+
+def discover_enabled_servers() -> list[str]:
+    """Query `scripts/mcp-servers.sh list` for enabled servers, falling back to defaults."""
+    helper = Path(__file__).resolve().parent / "mcp-servers.sh"
+    if helper.is_file():
+        try:
+            out = subprocess.check_output(
+                ["bash", str(helper), "list"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            servers = [line.strip() for line in out.splitlines() if line.strip()]
+            if servers:
+                return servers
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return list(DEFAULT_SERVERS)
+
+
+def run_security_and_health_checks(base_url: str, token: str, probe_server: str) -> None:
+    print("==> Security & Auth integration tests")
 
     r_no_auth = http_request(f"{base_url}/_healthz")
     assert r_no_auth.status == 401, f"Expected 401 for unauthenticated /_healthz, got {r_no_auth.status}"
-    print(f"    PASS  GET /_healthz (no token)       -> HTTP {r_no_auth.status} ({r_no_auth.elapsed_ms:.1f} ms)")
+    print(f"    PASS  GET /_healthz (no token)          -> HTTP {r_no_auth.status} ({r_no_auth.elapsed_ms:.1f} ms)")
 
     r_bad_auth = http_request(f"{base_url}/_healthz", headers={"Authorization": "Bearer invalid-token"})
     assert r_bad_auth.status == 401, f"Expected 401 for bad token on /_healthz, got {r_bad_auth.status}"
-    print(f"    PASS  GET /_healthz (wrong token)    -> HTTP {r_bad_auth.status} ({r_bad_auth.elapsed_ms:.1f} ms)")
+    print(f"    PASS  GET /_healthz (wrong token)       -> HTTP {r_bad_auth.status} ({r_bad_auth.elapsed_ms:.1f} ms)")
 
     r_mcp_no_auth = http_request(
-        f"{base_url}/context7/mcp",
+        f"{base_url}/{probe_server}/mcp",
         method="POST",
         payload={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
     )
-    assert r_mcp_no_auth.status == 401, f"Expected 401 for unauthenticated /context7/mcp, got {r_mcp_no_auth.status}"
-    print(f"    PASS  POST /context7/mcp (no token)  -> HTTP {r_mcp_no_auth.status} ({r_mcp_no_auth.elapsed_ms:.1f} ms)")
+    assert r_mcp_no_auth.status == 401, (
+        f"Expected 401 for unauthenticated /{probe_server}/mcp, got {r_mcp_no_auth.status}"
+    )
+    print(
+        f"    PASS  POST /{probe_server}/mcp (no token) -> HTTP {r_mcp_no_auth.status} ({r_mcp_no_auth.elapsed_ms:.1f} ms)"
+    )
 
     auth_headers = {"Authorization": f"Bearer {token}"}
     r_health = http_request(f"{base_url}/_healthz", headers=auth_headers)
     assert r_health.status == 200, f"Expected 200 for /_healthz with token, got {r_health.status}: {r_health.body}"
     health_json = json.loads(r_health.body)
     assert health_json.get("status") == "ok", f"Unexpected /_healthz payload: {health_json}"
-    print(f"    PASS  GET /_healthz (authorized)     -> HTTP 200 ({r_health.elapsed_ms:.1f} ms) servers={health_json.get('serverCount')}")
+    print(
+        f"    PASS  GET /_healthz (authorized)        -> HTTP 200 ({r_health.elapsed_ms:.1f} ms) "
+        f"servers={health_json.get('serverCount')}"
+    )
 
     r_ready = http_request(f"{base_url}/_readyz", headers=auth_headers)
     assert r_ready.status == 200, f"Expected 200 for /_readyz with token, got {r_ready.status}: {r_ready.body}"
     ready_json = json.loads(r_ready.body)
     assert not ready_json.get("unhealthy"), f"Unhealthy servers reported: {ready_json}"
-    print(f"    PASS  GET /_readyz (authorized)      -> HTTP 200 ({r_ready.elapsed_ms:.1f} ms) status={ready_json.get('status')}")
+    print(
+        f"    PASS  GET /_readyz (authorized)         -> HTTP 200 ({r_ready.elapsed_ms:.1f} ms) "
+        f"status={ready_json.get('status')}"
+    )
 
 
 def run_uv_time_e2e(base_url: str, token: str) -> McpStreamableClient:
-    print("\n==> [2/4] E2E test: uv-time (verifies uv/uvx stdio MCP end-to-end)")
+    print("\n==> E2E test: uv-time (verifies uv/uvx stdio MCP end-to-end)")
     client = McpStreamableClient(f"{base_url}/uv-time/mcp", token)
     init_ms = client.initialize()
     tools, list_ms = client.list_tools()
@@ -325,7 +355,7 @@ def run_uv_time_e2e(base_url: str, token: str) -> McpStreamableClient:
 
 
 def run_context7_e2e(base_url: str, token: str) -> McpStreamableClient:
-    print("\n==> [3/4] E2E test: context7 (remote Streamable HTTP MCP)")
+    print("\n==> E2E test: context7 (remote Streamable HTTP MCP)")
     client = McpStreamableClient(f"{base_url}/context7/mcp", token)
     init_ms = client.initialize()
     tools, list_ms = client.list_tools()
@@ -350,74 +380,168 @@ def run_context7_e2e(base_url: str, token: str) -> McpStreamableClient:
     return client
 
 
-def run_gemini_e2e(base_url: str, token: str, call_api: bool) -> None:
-    print("\n==> [Optional] E2E test: gemini (local uv-runnable Gemini MCP)")
-    client = McpStreamableClient(f"{base_url}/gemini/mcp", token, timeout=60.0)
+def run_mcpx_logs_e2e(base_url: str, token: str) -> McpStreamableClient:
+    print("\n==> E2E test: mcpx-logs (gateway and server log inspection MCP)")
+    client = McpStreamableClient(f"{base_url}/mcpx-logs/mcp", token)
     init_ms = client.initialize()
     tools, list_ms = client.list_tools()
     tool_names = [t.get("name") for t in tools]
-    assert "gemini_generate" in tool_names, f"Expected gemini_generate in gemini tools, got {tool_names}"
-    if call_api:
-        result, call_ms = client.call_tool("gemini_generate", {"prompt": "Reply with exactly: OK"})
-        assert not result.get("isError"), f"gemini_generate returned error: {result}"
-        text_blob = " ".join(str(c.get("text") or "") for c in result.get("content", [])).strip()
-        assert text_blob, f"gemini_generate returned empty response: {result}"
+    assert "list_log_sources" in tool_names, f"Expected list_log_sources in mcpx-logs tools, got {tool_names}"
+    assert "get_logs" in tool_names, f"Expected get_logs in mcpx-logs tools, got {tool_names}"
+
+    sources_res, sources_ms = client.call_tool("list_log_sources", {})
+    assert not sources_res.get("isError"), f"mcpx-logs list_log_sources returned error: {sources_res}"
+    sources_text = " ".join(str(c.get("text", "")) for c in sources_res.get("content", [])).strip()
+    assert sources_text, f"Expected non-empty log sources output, got: {sources_res}"
+
+    proxy_res, proxy_ms = client.call_tool("get_logs", {"source": "mcp-proxy", "lines": 20})
+    assert not proxy_res.get("isError"), f"mcpx-logs get_logs(mcp-proxy) returned error: {proxy_res}"
+    assert proxy_res.get("content"), f"Expected content from get_logs(mcp-proxy), got: {proxy_res}"
+
+    self_res, self_ms = client.call_tool("get_logs", {"source": "mcpx-logs", "lines": 20})
+    assert not self_res.get("isError"), f"mcpx-logs get_logs(mcpx-logs) returned error: {self_res}"
+    assert self_res.get("content"), f"Expected content from get_logs(mcpx-logs), got: {self_res}"
+
+    print(
+        f"    PASS  mcpx-logs initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
+        f"list_log_sources={sources_ms:.1f}ms get_logs(mcp-proxy)={proxy_ms:.1f}ms "
+        f"get_logs(mcpx-logs)={self_ms:.1f}ms tools={tool_names}"
+    )
+    return client
+
+
+def run_gemini_sound_e2e(base_url: str, token: str, call_generate: bool) -> McpStreamableClient:
+    print("\n==> E2E test: gemini-sound (local uv Gemini TTS/audio MCP)")
+    client = McpStreamableClient(f"{base_url}/gemini-sound/mcp", token, timeout=90.0)
+    init_ms = client.initialize()
+    tools, list_ms = client.list_tools()
+    tool_names = [t.get("name") for t in tools]
+    assert "gemini_generate_sound" in tool_names, (
+        f"Expected gemini_generate_sound in gemini-sound tools, got {tool_names}"
+    )
+    assert "gemini_sound_list_voices" in tool_names, (
+        f"Expected gemini_sound_list_voices in gemini-sound tools, got {tool_names}"
+    )
+
+    voices_res, voices_ms = client.call_tool("gemini_sound_list_voices", {})
+    assert not voices_res.get("isError"), f"gemini_sound_list_voices returned error: {voices_res}"
+    voices_text = " ".join(str(c.get("text", "")) for c in voices_res.get("content", [])).strip()
+    assert voices_text, f"Expected non-empty voice list from gemini_sound_list_voices, got: {voices_res}"
+
+    if call_generate:
+        gen_tool = next(t for t in tools if t.get("name") == "gemini_generate_sound")
+        props = gen_tool.get("inputSchema", {}).get("properties", {})
+        if "text" in props:
+            gen_args: dict[str, Any] = {"text": "MCPX audio check."}
+        elif "prompt" in props:
+            gen_args = {"prompt": "MCPX audio check."}
+        else:
+            required = gen_tool.get("inputSchema", {}).get("required", [])
+            first_key = required[0] if required else next(iter(props), "text")
+            gen_args = {first_key: "MCPX audio check."}
+
+        gen_res, gen_ms = client.call_tool("gemini_generate_sound", gen_args)
+        assert not gen_res.get("isError"), f"gemini_generate_sound returned error: {gen_res}"
+        audio_items = [c for c in gen_res.get("content", []) if c.get("type") == "audio"]
+        assert audio_items, f"Expected AudioContent item from gemini_generate_sound, got: {gen_res}"
+
+        audio = audio_items[0]
+        mime = str(audio.get("mimeType", ""))
+        assert mime.startswith("audio/wav"), f"Expected audio/wav mimeType, got: {mime!r}"
+        raw_b64 = audio.get("data", "")
+        assert isinstance(raw_b64, str) and raw_b64, "AudioContent data is empty"
+        wav_bytes = base64.b64decode(raw_b64)
+        assert len(wav_bytes) >= 44 and wav_bytes[:4] == b"RIFF" and wav_bytes[8:12] == b"WAVE", (
+            f"Decoded audio is not a valid WAV file (len={len(wav_bytes)}, header={wav_bytes[:12]!r})"
+        )
         print(
-            f"    PASS  gemini initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
-            f"gemini_generate={call_ms:.1f}ms"
+            f"    PASS  gemini-sound initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
+            f"list_voices={voices_ms:.1f}ms gemini_generate_sound={gen_ms:.1f}ms "
+            f"wav_bytes={len(wav_bytes)} mime={mime}"
         )
     else:
-        print(f"    PASS  gemini initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms tools={tool_names}")
+        print(
+            f"    PASS  gemini-sound initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms "
+            f"list_voices={voices_ms:.1f}ms tools={tool_names}"
+        )
+    return client
+
+
+def run_generic_server_e2e(base_url: str, token: str, server_name: str) -> McpStreamableClient:
+    print(f"\n==> E2E test: {server_name} (generic Streamable HTTP MCP)")
+    client = McpStreamableClient(f"{base_url}/{server_name}/mcp", token)
+    init_ms = client.initialize()
+    tools, list_ms = client.list_tools()
+    tool_names = [t.get("name") for t in tools]
+    assert tool_names, f"Expected at least one tool from {server_name}, got empty list"
+    print(f"    PASS  {server_name} initialize={init_ms:.1f}ms tools/list={list_ms:.1f}ms tools={tool_names}")
+    return client
 
 
 def run_profiling(
     base_url: str,
     token: str,
-    uv_client: McpStreamableClient,
-    c7_client: McpStreamableClient,
+    uv_client: Optional[McpStreamableClient],
+    c7_client: Optional[McpStreamableClient],
+    logs_client: Optional[McpStreamableClient],
     iterations: int,
     max_p95_health_ms: float,
     max_p95_uv_ms: float,
 ) -> list[ProfileSummary]:
-    print(f"\n==> [4/4] Latency profiling ({iterations} warm iterations each)")
+    print(f"\n==> Latency profiling ({iterations} warm iterations each)")
     auth_headers = {"Authorization": f"Bearer {token}"}
 
     health_prof = ProfileSummary("GET /_healthz (HTTPS + auth)")
-    uv_prof = ProfileSummary("POST /uv-time/mcp tools/call (uvx stdio)")
-    c7_prof = ProfileSummary("POST /context7/mcp tools/list (remote proxy)")
+    summaries: list[ProfileSummary] = [health_prof]
+
+    uv_prof = ProfileSummary("POST /uv-time/mcp tools/call (uvx stdio)") if uv_client else None
+    c7_prof = ProfileSummary("POST /context7/mcp tools/list (remote proxy)") if c7_client else None
+    logs_prof = ProfileSummary("POST /mcpx-logs/mcp tools/call (list_log_sources)") if logs_client else None
+    for prof in (uv_prof, c7_prof, logs_prof):
+        if prof is not None:
+            summaries.append(prof)
 
     for _ in range(iterations):
         r = http_request(f"{base_url}/_healthz", headers=auth_headers)
         assert r.status == 200
         health_prof.samples_ms.append(r.elapsed_ms)
 
-        _, uv_ms = uv_client.call_tool("get_current_time", {"timezone": "UTC"})
-        uv_prof.samples_ms.append(uv_ms)
+        if uv_client and uv_prof:
+            _, uv_ms = uv_client.call_tool("get_current_time", {"timezone": "UTC"})
+            uv_prof.samples_ms.append(uv_ms)
 
-        _, c7_ms = c7_client.list_tools()
-        c7_prof.samples_ms.append(c7_ms)
+        if c7_client and c7_prof:
+            _, c7_ms = c7_client.list_tools()
+            c7_prof.samples_ms.append(c7_ms)
 
-    summaries = [health_prof, uv_prof, c7_prof]
-    print(f"\n{'Operation':<44} {'Min':>8} {'p50':>8} {'Avg':>8} {'p95':>8} {'Max':>8}")
-    print("-" * 88)
+        if logs_client and logs_prof:
+            _, logs_ms = logs_client.call_tool("list_log_sources", {})
+            logs_prof.samples_ms.append(logs_ms)
+
+    print(f"\n{'Operation':<52} {'Min':>8} {'p50':>8} {'Avg':>8} {'p95':>8} {'Max':>8}")
+    print("-" * 96)
     for s in summaries:
         print(
-            f"{s.name:<44} {s.min_ms:>7.1f}ms {s.p50_ms:>7.1f}ms "
+            f"{s.name:<52} {s.min_ms:>7.1f}ms {s.p50_ms:>7.1f}ms "
             f"{s.avg_ms:>7.1f}ms {s.p95_ms:>7.1f}ms {s.max_ms:>7.1f}ms"
         )
 
     assert health_prof.p95_ms <= max_p95_health_ms, (
         f"Healthcheck p95 latency {health_prof.p95_ms:.1f}ms exceeded budget {max_p95_health_ms:.1f}ms"
     )
-    assert uv_prof.p95_ms <= max_p95_uv_ms, (
-        f"uv-time tool call p95 latency {uv_prof.p95_ms:.1f}ms exceeded budget {max_p95_uv_ms:.1f}ms"
-    )
-    print(
-        f"\n    PASS  Latency budgets satisfied "
-        f"(health p95 {health_prof.p95_ms:.1f}ms <= {max_p95_health_ms:.0f}ms, "
-        f"uv-time p95 {uv_prof.p95_ms:.1f}ms <= {max_p95_uv_ms:.0f}ms)"
-    )
+    if uv_prof is not None:
+        assert uv_prof.p95_ms <= max_p95_uv_ms, (
+            f"uv-time tool call p95 latency {uv_prof.p95_ms:.1f}ms exceeded budget {max_p95_uv_ms:.1f}ms"
+        )
+    budget_note = f"health p95 {health_prof.p95_ms:.1f}ms <= {max_p95_health_ms:.0f}ms"
+    if uv_prof is not None:
+        budget_note += f", uv-time p95 {uv_prof.p95_ms:.1f}ms <= {max_p95_uv_ms:.0f}ms"
+    print(f"\n    PASS  Latency budgets satisfied ({budget_note})")
     return summaries
+
+
+def _parse_csv(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def main() -> int:
@@ -437,11 +561,24 @@ def main() -> int:
         default=os.environ.get("MCP_BEARER_TOKEN", ""),
         help="Gateway Bearer token (default: $MCP_BEARER_TOKEN)",
     )
+    parser.add_argument(
+        "--servers",
+        default="",
+        help="Comma-separated servers to test (default: auto-detected via scripts/mcp-servers.sh list)",
+    )
+    parser.add_argument(
+        "--skip-servers",
+        default="",
+        help="Comma-separated servers to skip (e.g. gemini-sound,context7)",
+    )
+    parser.add_argument(
+        "--call-gemini-sound",
+        action="store_true",
+        help="Invoke gemini_generate_sound and verify valid WAV AudioContent (uses Gemini API)",
+    )
     parser.add_argument("--iterations", type=int, default=5, help="Warm profiling iterations per operation")
     parser.add_argument("--max-p95-health-ms", type=float, default=1500.0, help="p95 budget for /_healthz (ms)")
     parser.add_argument("--max-p95-uv-ms", type=float, default=2000.0, help="p95 budget for uv-time tools/call (ms)")
-    parser.add_argument("--include-gemini", action="store_true", help="Also run E2E check against /gemini/mcp")
-    parser.add_argument("--call-gemini", action="store_true", help="Invoke gemini_generate (requires GEMINI_API_KEY)")
     parser.add_argument("--json-out", default="", help="Optional path to write JSON profiling report")
     args = parser.parse_args()
 
@@ -452,17 +589,37 @@ def main() -> int:
     if not base_url or not args.token:
         parser.error("Provide --base-url (or MCP_SUBDOMAIN / DOMAIN) and --token (or MCP_BEARER_TOKEN).")
 
-    run_security_and_health_checks(base_url, args.token)
-    uv_client = run_uv_time_e2e(base_url, args.token)
-    c7_client = run_context7_e2e(base_url, args.token)
-    if args.include_gemini or args.call_gemini:
-        run_gemini_e2e(base_url, args.token, call_api=args.call_gemini)
+    servers = _parse_csv(args.servers) if args.servers else discover_enabled_servers()
+    skip = set(_parse_csv(args.skip_servers))
+    active_servers = [s for s in servers if s not in skip]
+    if not active_servers:
+        parser.error("No servers selected to test after applying --skip-servers.")
+
+    probe_server = "context7" if "context7" in active_servers else active_servers[0]
+    run_security_and_health_checks(base_url, args.token, probe_server=probe_server)
+
+    uv_client: Optional[McpStreamableClient] = None
+    c7_client: Optional[McpStreamableClient] = None
+    logs_client: Optional[McpStreamableClient] = None
+
+    for server in active_servers:
+        if server == "uv-time":
+            uv_client = run_uv_time_e2e(base_url, args.token)
+        elif server == "context7":
+            c7_client = run_context7_e2e(base_url, args.token)
+        elif server == "mcpx-logs":
+            logs_client = run_mcpx_logs_e2e(base_url, args.token)
+        elif server == "gemini-sound":
+            run_gemini_sound_e2e(base_url, args.token, call_generate=args.call_gemini_sound)
+        else:
+            run_generic_server_e2e(base_url, args.token, server)
 
     summaries = run_profiling(
         base_url,
         args.token,
-        uv_client,
-        c7_client,
+        uv_client=uv_client,
+        c7_client=c7_client,
+        logs_client=logs_client,
         iterations=args.iterations,
         max_p95_health_ms=args.max_p95_health_ms,
         max_p95_uv_ms=args.max_p95_uv_ms,
@@ -471,6 +628,7 @@ def main() -> int:
     if args.json_out:
         report = {
             "baseUrl": base_url,
+            "servers": active_servers,
             "iterations": args.iterations,
             "profiles": [
                 {
